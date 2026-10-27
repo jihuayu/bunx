@@ -41,6 +41,24 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+impl ConnectError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Timeout => "ERR_SSH_CONNECT_TIMEOUT",
+            Self::HostKey(error) => error.code(),
+            Self::Protocol(_) => "ERR_SSH_PROTOCOL",
+            Self::Io(_) => "ERR_SSH_CONNECT",
+        }
+    }
+
+    pub fn phase(&self) -> &'static str {
+        match self {
+            Self::Timeout | Self::Io(_) | Self::Protocol(_) => "handshake",
+            Self::HostKey(_) => "host-key",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AuthError {
     Timeout,
@@ -63,6 +81,56 @@ impl std::fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+impl AuthError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Timeout => "ERR_SSH_AUTH_TIMEOUT",
+            Self::Rejected | Self::InvalidKey(_) => "ERR_SSH_AUTH",
+            Self::Protocol(_) => "ERR_SSH_PROTOCOL",
+            Self::ConnectionLost => "ERR_SSH_CONNECTION_LOST",
+        }
+    }
+
+    pub fn phase(&self) -> &'static str {
+        "auth"
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloseResult {
+    pub forced: bool,
+}
+
+#[derive(Debug)]
+pub enum CloseError {
+    Timeout,
+    Protocol(String),
+}
+
+impl std::fmt::Display for CloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("SSH close timed out"),
+            Self::Protocol(message) => write!(f, "SSH close error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for CloseError {}
+
+impl CloseError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Timeout => "ERR_SSH_TIMEOUT",
+            Self::Protocol(_) => "ERR_SSH_PROTOCOL",
+        }
+    }
+
+    pub fn phase(&self) -> &'static str {
+        "close"
+    }
+}
 
 struct CheckState {
     sender: Option<oneshot::Sender<Result<ConnectionInfo, HostKeyError>>>,
@@ -137,25 +205,94 @@ impl Handler for ClientHandler {
     }
 }
 
-/// An authenticated SSH transport.
-pub struct Session {
-    handle: Handle<ClientHandler>,
+struct SessionInner {
+    /// Declared before `runtime` so the handle is dropped first; the reactor
+    /// must outlive the driver task the handle joins on.
+    handle: Mutex<Option<Handle<ClientHandler>>>,
     info: ConnectionInfo,
+    /// Keeps the russh driver task's Tokio reactor alive for the session.
+    _runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+/// An authenticated SSH transport.
+///
+/// Cloning a session shares one transport. Closing any clone closes the
+/// transport for all of them; concurrent and repeated closes are idempotent.
+#[derive(Clone)]
+pub struct Session {
+    inner: Arc<SessionInner>,
 }
 
 impl Session {
     pub fn info(&self) -> &ConnectionInfo {
-        &self.info
+        &self.inner.info
     }
 
-    pub async fn close(self) -> Result<(), RusshError> {
-        self.handle
-            .disconnect(Disconnect::ByApplication, "", "")
-            .await
+    pub fn is_closed(&self) -> bool {
+        self.inner
+            .handle
+            .try_lock()
+            .map_or(false, |handle| handle.is_none())
+    }
+
+    pub async fn close(&self) -> Result<CloseResult, CloseError> {
+        self.close_with_timeout(Duration::from_secs(5)).await
+    }
+
+    pub async fn close_with_timeout(
+        &self,
+        grace_period: Duration,
+    ) -> Result<CloseResult, CloseError> {
+        let mut slot = self.inner.handle.lock().await;
+        let Some(mut handle) = slot.take() else {
+            return Ok(CloseResult { forced: false });
+        };
+
+        match tokio::time::timeout(
+            grace_period,
+            handle.disconnect(Disconnect::ByApplication, "", ""),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if handle.is_closed() => {
+                let _ = error;
+                return Ok(CloseResult { forced: false });
+            }
+            Ok(Err(error)) => return Err(CloseError::Protocol(error.to_string())),
+            Err(_) => return Ok(CloseResult { forced: true }),
+        }
+
+        match tokio::time::timeout(grace_period, &mut handle).await {
+            Ok(Ok(())) => Ok(CloseResult { forced: false }),
+            Ok(Err(_)) => {
+                // The transport is gone, which is the postcondition of close.
+                Ok(CloseResult { forced: false })
+            }
+            Err(_) => Ok(CloseResult { forced: true }),
+        }
     }
 }
 
 pub async fn connect(config: &Config) -> Result<Session, ConnectError> {
+    connect_inner(config, None).await
+}
+
+/// Connect with a dedicated Tokio runtime retained by the returned session.
+///
+/// This is the entry point for the JavaScript bridge: russh's driver task and
+/// later authentication/close calls must all run on the same live reactor.
+pub async fn connect_with_runtime(
+    config: &Config,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<Session, ConnectError> {
+    connect_inner(config, Some(runtime)).await
+}
+
+async fn connect_inner(
+    config: &Config,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+) -> Result<Session, ConnectError> {
     let (sender, receiver) = oneshot::channel();
     let state = Arc::new(Mutex::new(CheckState {
         sender: Some(sender),
@@ -194,14 +331,24 @@ pub async fn connect(config: &Config) -> Result<Session, ConnectError> {
             return Err(ConnectError::HostKey(error));
         }
     };
-    Ok(Session { handle, info })
+    Ok(Session {
+        inner: Arc::new(SessionInner {
+            handle: Mutex::new(Some(handle)),
+            info,
+            _runtime: runtime,
+        }),
+    })
 }
 
 impl Session {
-    pub async fn authenticate(&mut self, config: &Config) -> Result<(), AuthError> {
+    pub async fn authenticate(&self, config: &Config) -> Result<(), AuthError> {
+        let mut slot = self.inner.handle.lock().await;
+        let handle = slot
+            .as_mut()
+            .ok_or_else(|| AuthError::Protocol("SSH session is closed".into()))?;
         let result = tokio::time::timeout(
             Duration::from_millis(config.authentication_timeout_ms),
-            authenticate_inner(&mut self.handle, config),
+            authenticate_inner(handle, config),
         )
         .await
         .map_err(|_| AuthError::Timeout)??;
@@ -424,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn connects_and_authenticates_with_password() {
         let server = start_server().await;
-        let mut session = connect(&config(&server, known_hosts(&server), password_auth()))
+        let session = connect(&config(&server, known_hosts(&server), password_auth()))
             .await
             .unwrap();
         assert_eq!(session.info().hostname, "127.0.0.1");
@@ -468,7 +615,7 @@ mod tests {
                 passphrase: None,
             },
         );
-        let mut session = connect(&config).await.unwrap();
+        let session = connect(&config).await.unwrap();
         session.authenticate(&config).await.unwrap();
         assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
         session.close().await.unwrap();
@@ -539,7 +686,7 @@ mod tests {
     async fn authentication_rejection_is_reported() {
         let server = start_server().await;
         let auth = Auth::Password(crate::Secret::Text("wrong".into()));
-        let mut session = connect(&config(&server, known_hosts(&server), auth.clone()))
+        let session = connect(&config(&server, known_hosts(&server), auth.clone()))
             .await
             .unwrap();
         assert!(matches!(
@@ -549,5 +696,22 @@ mod tests {
             Err(AuthError::Rejected)
         ));
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_is_shared_and_idempotent() {
+        let server = start_server().await;
+        let config = config(&server, known_hosts(&server), password_auth());
+        let session = connect(&config).await.unwrap();
+        session.authenticate(&config).await.unwrap();
+
+        let clone = session.clone();
+        let (first, second) = tokio::join!(session.close(), clone.close());
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+
+        let result = session.close().await.unwrap();
+        assert!(!result.forced);
+        assert!(session.is_closed());
     }
 }
