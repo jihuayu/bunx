@@ -80,6 +80,18 @@ pub struct Config {
     pub queue_timeout_ms: u64,
 }
 
+/// The connection and host-verification inputs needed before any authentication
+/// secret is resolved.
+#[derive(Clone, Debug)]
+pub struct TransportConfig {
+    pub hostname: String,
+    pub port: u16,
+    pub username: String,
+    pub host_key: HostKeyPolicy,
+    pub connect_timeout_ms: u64,
+    pub max_channels: usize,
+}
+
 impl Config {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -146,6 +158,17 @@ impl Config {
             max_pending_operations,
             queue_timeout_ms,
         })
+    }
+
+    pub fn transport(&self) -> TransportConfig {
+        TransportConfig {
+            hostname: self.hostname.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            host_key: self.host_key.clone(),
+            connect_timeout_ms: self.connect_timeout_ms,
+            max_channels: self.max_channels,
+        }
     }
 }
 

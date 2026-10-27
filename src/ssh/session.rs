@@ -6,7 +6,7 @@ use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_k
 use russh::{Disconnect, Error as RusshError};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::config::{Auth, Config};
+use crate::config::{Auth, Config, TransportConfig};
 use crate::host_key::{HostKeyError, fingerprint, sign_algorithm_name, verifier};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +275,12 @@ impl Session {
 }
 
 pub async fn connect(config: &Config) -> Result<Session, ConnectError> {
+    connect_transport(&config.transport()).await
+}
+
+/// Connect and verify the server host key without resolving or sending an
+/// authentication secret.
+pub async fn connect_transport(config: &TransportConfig) -> Result<Session, ConnectError> {
     connect_inner(config, None).await
 }
 
@@ -286,11 +292,18 @@ pub async fn connect_with_runtime(
     config: &Config,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Session, ConnectError> {
+    connect_transport_with_runtime(&config.transport(), runtime).await
+}
+
+pub async fn connect_transport_with_runtime(
+    config: &TransportConfig,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<Session, ConnectError> {
     connect_inner(config, Some(runtime)).await
 }
 
 async fn connect_inner(
-    config: &Config,
+    config: &TransportConfig,
     runtime: Option<Arc<tokio::runtime::Runtime>>,
 ) -> Result<Session, ConnectError> {
     let (sender, receiver) = oneshot::channel();
@@ -342,13 +355,27 @@ async fn connect_inner(
 
 impl Session {
     pub async fn authenticate(&self, config: &Config) -> Result<(), AuthError> {
+        self.authenticate_with(
+            &config.auth,
+            config.username.as_str(),
+            config.authentication_timeout_ms,
+        )
+        .await
+    }
+
+    pub async fn authenticate_with(
+        &self,
+        auth: &Auth,
+        username: &str,
+        authentication_timeout_ms: u64,
+    ) -> Result<(), AuthError> {
         let mut slot = self.inner.handle.lock().await;
         let handle = slot
             .as_mut()
             .ok_or_else(|| AuthError::Protocol("SSH session is closed".into()))?;
         let result = tokio::time::timeout(
-            Duration::from_millis(config.authentication_timeout_ms),
-            authenticate_inner(handle, config),
+            Duration::from_millis(authentication_timeout_ms),
+            authenticate_inner(handle, auth, username),
         )
         .await
         .map_err(|_| AuthError::Timeout)??;
@@ -362,15 +389,16 @@ impl Session {
 
 async fn authenticate_inner(
     handle: &mut Handle<ClientHandler>,
-    config: &Config,
+    auth: &Auth,
+    username: &str,
 ) -> Result<AuthResult, AuthError> {
-    match &config.auth {
+    match auth {
         Auth::Password(secret) => {
             let password = secret
                 .as_utf8()
                 .map_err(|message| AuthError::Protocol(message.to_string()))?;
             handle
-                .authenticate_password(config.username.clone(), password.into_owned())
+                .authenticate_password(username.to_string(), password.into_owned())
                 .await
                 .map_err(map_auth_error)
         }
@@ -395,7 +423,7 @@ async fn authenticate_inner(
                 .flatten();
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_algorithm);
             handle
-                .authenticate_publickey(config.username.clone(), key)
+                .authenticate_publickey(username.to_string(), key)
                 .await
                 .map_err(map_auth_error)
         }

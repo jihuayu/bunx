@@ -8,6 +8,6 @@ pub mod config;
 pub mod host_key;
 pub mod session;
 
-pub use config::{Auth, Config, HostKeyPolicy, KnownHostsSource, Secret};
+pub use config::{Auth, Config, HostKeyPolicy, KnownHostsSource, Secret, TransportConfig};
 pub use host_key::{HostKeyError, HostKeyVerifier, KnownHosts, PinnedHostKeys};
 pub use session::{AuthError, ConnectError, ConnectionInfo, Session};
