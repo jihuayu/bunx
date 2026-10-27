@@ -13,6 +13,7 @@ const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_CHANNELS = 8;
 const DEFAULT_MAX_PENDING_OPERATIONS = 64;
 const DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
+const SHA256_PREFIX = "SHA256:";
 
 const configObjectKeys = [
   "hostname",
@@ -154,8 +155,8 @@ function snapshotHostKey(value: unknown) {
     const pins = new Array(sha256.length);
     for (let i = 0; i < sha256.length; i++) {
       const pin = sha256[i];
-      if (typeof pin !== "string") {
-        configError('SSH option "hostKey.sha256" must be a non-empty array of strings');
+      if (typeof pin !== "string" || !pin.startsWith(SHA256_PREFIX) || pin.length === SHA256_PREFIX.length) {
+        configError('SSH option "hostKey.sha256" must contain SHA256: fingerprints');
       }
       pins[i] = pin;
     }

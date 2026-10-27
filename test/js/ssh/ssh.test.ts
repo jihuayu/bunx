@@ -202,6 +202,9 @@ describe("Bun.SSH constructor", () => {
   test("rejects invalid pinned host keys", () => {
     expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: [] } }));
     expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["ok", 1] } }));
+    expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["ok"] } }));
+    expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["SHA256:"] } }));
+    expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["MD5:abc"] } }));
     expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["ok"], extra: true } }));
   });
 
