@@ -1,0 +1,13 @@
+//! Protocol and policy layer for `Bun.SSH`.
+//!
+//! This crate deliberately has no JavaScriptCore dependency. Tokio and russh
+//! stay behind this API so the JSC bridge can keep all protocol state off the
+//! JavaScript thread.
+
+pub mod config;
+pub mod host_key;
+pub mod session;
+
+pub use config::{Auth, Config, HostKeyPolicy, KnownHostsSource, Secret};
+pub use host_key::{HostKeyError, HostKeyVerifier, KnownHosts, PinnedHostKeys};
+pub use session::{AuthError, ConnectError, ConnectionInfo, Session};

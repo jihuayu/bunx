@@ -1,0 +1,27 @@
+[package]
+name = "bun_ssh"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+data-encoding = "2"
+hmac = "0.13"
+russh = { version = "0.65.0", default-features = false, features = ["ring", "rsa"] }
+sha1 = "0.11"
+tokio = { version = "1.17.0", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+rand = { version = "0.10", features = ["thread_rng"] }

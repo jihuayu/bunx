@@ -85,6 +85,7 @@ members = [
   "src/perf",
   "src/resolve_builtins",
   "src/sourcemap_jsc",
+  "src/ssh",
   "src/url",
   "src/windows_sys",
   "src/jsc",
