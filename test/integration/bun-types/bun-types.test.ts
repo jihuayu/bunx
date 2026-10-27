@@ -1077,6 +1077,75 @@ describe("@types/bun integration test", () => {
     });
   });
 
+  describe("Bun.SSH options", () => {
+    typeTest("checks the constructor and strict option unions", {
+      files: {
+        "ssh.ts": `
+          import {
+            SSH,
+            SSHError,
+            type SSHAuth,
+            type SSHHostKeyPolicy,
+            type SSHOptions,
+            type SSHSecret,
+            type SecretSource,
+          } from "bun";
+
+          const passwordSource: SecretSource<SSHSecret> = ({ signal }) => {
+            return signal.aborted ? "" : Promise.resolve("secret");
+          };
+          const hostKey: SSHHostKeyPolicy = {
+            type: "pinned",
+            sha256: ["SHA256:abc"],
+          };
+          const auth: SSHAuth = {
+            type: "privateKey",
+            key: Bun.file("./id_ed25519"),
+            passphrase: passwordSource,
+          };
+          const options: SSHOptions = {
+            hostname: "example.com",
+            port: 22,
+            username: "deploy",
+            hostKey,
+            auth,
+            connectTimeoutMs: 10_000,
+            authenticationTimeoutMs: 30_000,
+            maxChannels: 8,
+            maxPendingOperations: 64,
+            queueTimeoutMs: 30_000,
+          };
+
+          const ssh: SSH = new SSH(options);
+          const bunSsh: Bun.SSH = new Bun.SSH(options);
+          const state: Bun.SSHState = ssh.state;
+          const info: Bun.SSHConnectionInfo | null = bunSsh.info;
+
+          declare const sshError: SSHError;
+          const code: Bun.SSHErrorCode = sshError.code;
+          const phase: Bun.SSHPhase = sshError.phase;
+          const remoteExecution: Bun.RemoteExecution = sshError.remoteExecution;
+
+          // @ts-expect-error - host keys must use an explicit supported policy
+          new SSH({ ...options, hostKey: { type: "none" } });
+
+          // @ts-expect-error - a pinned policy needs at least one fingerprint
+          new SSH({ ...options, hostKey: { type: "pinned", sha256: [] } });
+
+          // @ts-expect-error - private key authentication does not accept strings
+          new SSH({ ...options, auth: { type: "privateKey", key: "id_ed25519" } });
+
+          // @ts-expect-error - unknown configuration fields are rejected
+          new SSH({ ...options, hostnam: "example.com" });
+        `,
+      },
+      emptyInterfaces: expectedEmptyInterfacesWhenNoDOM,
+      diagnostics: diagnostics => {
+        expect(diagnostics.filter(diagnostic => diagnostic.line?.startsWith("ssh.ts"))).toEqual([]);
+      },
+    });
+  });
+
   describe("Bunland reaching for JSX", () => {
     typeTest("Bun.markdown.react() returns type compatible with React.ReactElement", {
       packages: ["@types/react", "@types/react-dom"],

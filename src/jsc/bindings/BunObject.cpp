@@ -322,6 +322,24 @@ static JSValue createBunSql(VM& vm, Zig::GlobalObject* globalObject)
     RELEASE_AND_RETURN(scope, sqlValue.getObject()->get(globalObject, vm.propertyNames->defaultKeyword));
 }
 
+static JSValue createBunSshExport(VM& vm, Zig::GlobalObject* globalObject, ASCIILiteral exportName)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue sshValue = globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::BunSsh);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, sshValue.getObject()->get(globalObject, Identifier::fromString(vm, exportName)));
+}
+
+static JSValue createBunSSHConstructor(VM& vm, Zig::GlobalObject* globalObject)
+{
+    return createBunSshExport(vm, globalObject, "SSH"_s);
+}
+
+static JSValue createBunSSHError(VM& vm, Zig::GlobalObject* globalObject)
+{
+    return createBunSshExport(vm, globalObject, "SSHError"_s);
+}
+
 static JSValue createBunSQLConstructor(VM& vm, Zig::GlobalObject* globalObject)
 {
     auto scope = DECLARE_THROW_SCOPE(vm);
@@ -388,6 +406,8 @@ static JSValue checkedBunObjectValue(VM& vm, JSObject* bunObject, JSValue (*crea
 static JSValue constructBunShell(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunShell); }
 static JSValue defaultBunSQLObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSql); }
 static JSValue constructBunSQLObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSQLConstructor); }
+static JSValue constructBunSSHObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSSHConstructor); }
+static JSValue constructBunSSHErrorObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSSHError); }
 
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
@@ -1016,6 +1036,8 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     sql                                            defaultBunSQLObject                                                 DontDelete|PropertyCallback
     postgres                                       defaultBunSQLObject                                                 DontDelete|PropertyCallback
     SQL                                            constructBunSQLObject                                               DontDelete|PropertyCallback
+    SSH                                            constructBunSSHObject                                               DontDelete|PropertyCallback
+    SSHError                                       constructBunSSHErrorObject                                          DontDelete|PropertyCallback
     serve                                          BunObject_callback_serve                                            DontDelete|Function 1
     sha                                            Bun::Bindgen::Generated::CryptoHasher::jsSha                        DontDelete|Function 1
     shrink                                         Bun::Bindgen::Generated::BunObject::jsShrink                        DontDelete|Function 0
