@@ -875,6 +875,37 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("connect timeout reports the native handshake phase", async () => {
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data() {},
+      },
+    });
+    try {
+      const ssh = new SSH({
+        hostname: "127.0.0.1",
+        port: listener.port,
+        username,
+        hostKey: { type: "pinned", sha256: ["SHA256:unused"] },
+        auth: { type: "password", password: "unused" },
+        connectTimeoutMs: 150,
+      });
+
+      const error = await ssh.connect().catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_CONNECT_TIMEOUT",
+        phase: "handshake",
+      });
+      expect(ssh.state).toBe("failed");
+      expect(await ssh.closed).toMatchObject({ reason: "failure", error });
+    } finally {
+      listener.stop(true);
+    }
+  });
+
   test("force close aborts an operation blocked reading stdin", async () => {
     const ssh = await connectedClient();
     let notifyPull = () => {};

@@ -1746,6 +1746,7 @@ class SSH {
     let authTimer = null;
 
     try {
+      const connectDeadline = performance.now() + this.#options.connectTimeoutMs;
       connectTimer = setDeadlineTimer(
         this.#options.connectTimeoutMs,
         () => operation.abort(CONNECT_TIMEOUT),
@@ -1763,6 +1764,13 @@ class SSH {
         throw abortError(signal, "host-key");
       }
 
+      connectTimer.clear();
+      connectTimer = null;
+      const remainingConnectMs = Math.ceil(connectDeadline - performance.now());
+      if (remainingConnectMs <= 0) {
+        throw runtimeError("SSH connection timed out", "ERR_SSH_CONNECT_TIMEOUT", "host-key");
+      }
+
       this.#phase = "handshake";
       native = this.#native = new NativeSSHConnection(
         this.#options.hostname,
@@ -1771,7 +1779,7 @@ class SSH {
         hostKey.type,
         knownHosts,
         pins,
-        this.#options.connectTimeoutMs,
+        remainingConnectMs,
         this.#options.maxChannels,
       );
 
@@ -1782,8 +1790,6 @@ class SSH {
       }
       transportAdopted = true;
 
-      connectTimer.clear();
-      connectTimer = null;
       this.#phase = "auth";
       const authStartedAt = performance.now();
       authTimer = setDeadlineTimer(
