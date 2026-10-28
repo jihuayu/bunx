@@ -114,7 +114,7 @@ jobs:
           chmod +x "dist/${package}/${exe}" 2>/dev/null || true
           (
             cd dist
-            zip -9 -r "${package}.zip" "${package}"
+            cmake -E tar cfv "${package}.zip" --format=zip "${package}"
             sha256sum "${package}.zip" > "${package}.sha256"
           )
 
