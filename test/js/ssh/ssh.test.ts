@@ -1585,6 +1585,27 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("collecting a running process releases its SSH channel", async () => {
+    const ssh = await connectedClient({
+      maxChannels: 1,
+      queueTimeoutMs: 500,
+    });
+    try {
+      await (async () => {
+        await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+      })();
+
+      for (let i = 0; i < 10; i++) {
+        Bun.gc(true);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+
+      expect((await ssh.exec("printf reusable")).text()).toBe("reusable");
+    } finally {
+      await ssh.close({ force: true });
+    }
+  });
+
   test("spawn timeout remains active after spawn resolves", async () => {
     const ssh = await connectedClient();
     try {

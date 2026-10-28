@@ -6,6 +6,8 @@ const ObjectCreate = Object.create;
 const ObjectAssign = Object.assign;
 const NumberIsSafeInteger = Number.isSafeInteger;
 const defineProperty = Object.defineProperty;
+const WeakRefCtor = WeakRef;
+const FinalizationRegistryCtor = FinalizationRegistry;
 
 const DEFAULT_PORT = 22;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
@@ -31,6 +33,11 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const AUTH_TIMEOUT = Symbol("SSH authentication timeout");
 const CONNECT_TIMEOUT = Symbol("SSH connection timeout");
+const liveProcesses = new FinalizationRegistryCtor(lifecycle => {
+  lifecycle.operation.signal.removeEventListener("abort", lifecycle.abortListener);
+  lifecycle.operation.cleanup();
+  lifecycle.release();
+});
 
 const configObjectKeys = [
   "hostname",
@@ -1031,6 +1038,7 @@ class SSHProcess {
   #release;
   #cancelPromise = null;
   #abortListener;
+  #lifecycle;
 
   constructor(native, options, operation, release, connectionLost) {
     this.#native = native;
@@ -1039,6 +1047,7 @@ class SSHProcess {
     this.#stderr = options.captureStderr ? processStream(native, "stderr", operation) : null;
     this.#operation = operation;
     this.#release = release;
+    const self = new WeakRefCtor(this);
 
     let exitPromise;
     try {
@@ -1050,7 +1059,10 @@ class SSHProcess {
       value => {
         const status = isRecord(value) ? snapshotExitStatus(value.status) : undefined;
         const result = status ?? ObjectFreeze({ type: "unknown" });
-        this.#exitStatus = result;
+        const process = self.deref();
+        if (process !== undefined) {
+          process.#exitStatus = result;
+        }
         return result;
       },
       cause => {
@@ -1076,12 +1088,26 @@ class SSHProcess {
     }
     this.#closed = Promise.allSettled([Promise.resolve(closedPromise), this.#exited]).then(() => {});
     this.#closed.then(() => {
-      this.#finish();
+      const process = self.deref();
+      if (process !== undefined) {
+        process.#finish();
+      }
     });
 
+    const selfForAbort = new WeakRefCtor(this);
     this.#abortListener = () => {
-      this.cancel().catch(() => {});
+      const process = selfForAbort.deref();
+      if (process !== undefined) {
+        process.cancel().catch(() => {});
+      }
     };
+    const lifecycle = {
+      operation,
+      release,
+      abortListener: this.#abortListener,
+    };
+    this.#lifecycle = lifecycle;
+    liveProcesses.register(this, lifecycle, lifecycle);
     if (operation.signal.aborted) {
       this.#abortListener();
     } else {
@@ -1152,6 +1178,12 @@ class SSHProcess {
   }
 
   #finish() {
+    const lifecycle = this.#lifecycle;
+    if (lifecycle === null) {
+      return;
+    }
+    this.#lifecycle = null;
+    liveProcesses.unregister(lifecycle);
     this.#operation.signal.removeEventListener("abort", this.#abortListener);
     this.#operation.cleanup();
     const release = this.#release;

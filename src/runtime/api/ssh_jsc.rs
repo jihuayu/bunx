@@ -519,6 +519,7 @@ impl SSHSpawnProcess {
     }
 
     pub(crate) fn finalize(&self) {
+        self.process.cancel();
         self.connection.finish_operation(self.operation_id);
     }
 
