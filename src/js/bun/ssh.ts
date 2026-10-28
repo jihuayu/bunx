@@ -1830,7 +1830,10 @@ class SSH {
 
       connectTimer.clear();
       connectTimer = null;
-      const remainingConnectMs = Math.ceil(connectDeadline - performance.now());
+      const remainingConnectMs = Math.min(
+        Math.ceil(connectDeadline - performance.now()),
+        Number.MAX_SAFE_INTEGER,
+      );
       if (remainingConnectMs <= 0) {
         throw runtimeError("SSH connection timed out", "ERR_SSH_CONNECT_TIMEOUT", "host-key");
       }
