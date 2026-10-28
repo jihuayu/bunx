@@ -34,6 +34,7 @@ const scratch = await mkdtemp(join(tmpdir(), "bun-musl-sysroot-"));
 function run(command: string, args: string[], capture = false): string {
   const result = spawnSync(command, args, {
     encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
     stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit",
   });
   if (result.error) throw result.error;
