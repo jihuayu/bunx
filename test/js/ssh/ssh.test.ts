@@ -1217,6 +1217,49 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test(
+    "a paused output stream cannot stall the other stream or exit status",
+    async () => {
+      const ssh = await connectedClient();
+      try {
+        const proc = await ssh.spawn("head -c 2097152 /dev/zero; printf tail >&2", {
+          timeoutMs: 5_000,
+        });
+
+        expect(new TextDecoder().decode(await readAll(proc.stderr))).toBe("tail");
+        expect(await proc.exited).toEqual({ type: "exit", code: 0 });
+        await proc.closed;
+
+        const reader = proc.stdout!.getReader();
+        let retained = 0;
+        let error: unknown;
+        try {
+          for (;;) {
+            const result = await reader.read();
+            if (result.done) {
+              break;
+            }
+            retained += result.value.byteLength;
+          }
+        } catch (cause) {
+          error = cause;
+        } finally {
+          reader.releaseLock();
+        }
+
+        expect(retained).toBeLessThanOrEqual(256 * 1024);
+        expect(error).toBeInstanceOf(SSHError);
+        expect(error).toMatchObject({
+          code: "ERR_SSH_OUTPUT_LIMIT",
+          phase: "io",
+        });
+      } finally {
+        await ssh.close();
+      }
+    },
+    5_000,
+  );
+
   test("spawn may observe exit before buffered output is consumed", async () => {
     const ssh = await connectedClient();
     try {

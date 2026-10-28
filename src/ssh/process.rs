@@ -100,13 +100,15 @@ impl OutputState {
 }
 
 struct OutputPipe {
+    name: &'static str,
     state: AsyncMutex<OutputState>,
     changed: watch::Sender<u64>,
 }
 
 impl OutputPipe {
-    fn new(discard: bool) -> Self {
+    fn new(name: &'static str, discard: bool) -> Self {
         Self {
+            name,
             state: AsyncMutex::new(OutputState::new(discard)),
             changed: watch::channel(0).0,
         }
@@ -118,44 +120,42 @@ impl OutputPipe {
         });
     }
 
-    async fn push(
-        &self,
-        data: Vec<u8>,
-        cancel: &mut watch::Receiver<bool>,
-    ) -> Result<(), ProcessError> {
+    async fn push(&self, mut data: Vec<u8>, remote_execution: RemoteExecution) {
         if data.is_empty() {
-            return Ok(());
+            return;
         }
 
-        loop {
-            let mut cancel_changed = cancel.clone();
-            if *cancel_changed.borrow() {
-                return Err(cancelled_error());
-            }
+        let mut state = self.state.lock().await;
+        if state.done || state.discard {
+            return;
+        }
 
-            // Subscribe before checking the queue so a consumer that drains the
-            // final chunk cannot race with the wait below.
-            let mut changed = self.changed.subscribe();
-            let mut state = self.state.lock().await;
-            if state.done || state.discard {
-                return Ok(());
-            }
-            if state.bytes.saturating_add(data.len()) <= MAX_OUTPUT_STREAM_BYTES {
+        let next = state.bytes.saturating_add(data.len());
+        if next <= MAX_OUTPUT_STREAM_BYTES {
+            state.bytes = next;
+            state.chunks.push_back(data);
+        } else {
+            let remaining = MAX_OUTPUT_STREAM_BYTES.saturating_sub(state.bytes);
+            if remaining != 0 {
+                data.truncate(remaining);
                 state.bytes += data.len();
                 state.chunks.push_back(data);
-                self.touch();
-                return Ok(());
             }
-            drop(state);
-
-            tokio::select! {
-                _ = changed.changed() => {}
-                result = cancel_changed.changed() => {
-                    let _ = result;
-                    return Err(cancelled_error());
-                }
+            state.done = true;
+            if state.error.is_none() {
+                state.error = Some(ProcessError::new(
+                    "ERR_SSH_OUTPUT_LIMIT",
+                    "io",
+                    format!(
+                        "SSH process {} consumer did not keep up within the {}-byte buffer",
+                        self.name, MAX_OUTPUT_STREAM_BYTES
+                    ),
+                    remote_execution,
+                ));
             }
         }
+        drop(state);
+        self.touch();
     }
 
     async fn read(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, ProcessError> {
@@ -400,8 +400,8 @@ pub(crate) fn start_driver(
     let (exit_sender, _) = watch::channel(ProcessExitState::Pending);
     let (closed_sender, _) = watch::channel(false);
     let inner = Arc::new(ProcessInner {
-        stdout: OutputPipe::new(!config.capture_stdout),
-        stderr: OutputPipe::new(!config.capture_stderr),
+        stdout: OutputPipe::new("stdout", !config.capture_stdout),
+        stderr: OutputPipe::new("stderr", !config.capture_stderr),
         stdin: input_sender,
         cancel: cancel_sender,
         exit: exit_sender,
@@ -458,9 +458,7 @@ async fn run_process_driver(
     let mut failure = None;
 
     for message in initial_messages {
-        if !handle_process_message(message, &inner, &mut cancel, &mut status, &mut clean_close)
-            .await
-        {
+        if !handle_process_message(message, &inner, &mut status, &mut clean_close).await {
             break;
         }
     }
@@ -479,7 +477,7 @@ async fn run_process_driver(
                     }
                     break;
                 };
-                if !handle_process_message(message, &inner, &mut cancel, &mut status, &mut clean_close).await {
+                if !handle_process_message(message, &inner, &mut status, &mut clean_close).await {
                     break;
                 }
             }
@@ -535,20 +533,21 @@ async fn run_process_driver(
 async fn handle_process_message(
     message: ChannelMsg,
     inner: &Arc<ProcessInner>,
-    cancel: &mut watch::Receiver<bool>,
     status: &mut Option<ExitStatus>,
     clean_close: &mut bool,
 ) -> bool {
     match message {
         ChannelMsg::Data { data } => {
-            if inner.stdout.push(data.to_vec(), cancel).await.is_err() {
-                return false;
-            }
+            inner
+                .stdout
+                .push(data.to_vec(), inner.remote_execution())
+                .await;
         }
         ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
-            if inner.stderr.push(data.to_vec(), cancel).await.is_err() {
-                return false;
-            }
+            inner
+                .stderr
+                .push(data.to_vec(), inner.remote_execution())
+                .await;
         }
         ChannelMsg::ExitStatus { exit_status } => {
             if status.is_none() {
