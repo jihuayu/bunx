@@ -1215,6 +1215,7 @@ class SSH {
   #closeDeadline = 0;
   #closeForceRequested = false;
   #closeWake = null;
+  #nativeClose = null;
   #livenessTimer = null;
 
   constructor(options: unknown) {
@@ -1965,6 +1966,9 @@ class SSH {
       } else {
         this.#closeDeadline = Math.min(this.#closeDeadline, performance.now() + closeOptions.gracePeriodMs);
       }
+      if (closeOptions.force) {
+        this.#cancelNativeClose();
+      }
       this.#wakeClose();
       return this.#closePromise;
     }
@@ -2020,8 +2024,13 @@ class SSH {
         if (remaining === 0) {
           forced = true;
         }
-        result = snapshotRecord(await this.#withAbortlessNativeError(native.close(remaining), "ERR_SSH_IO", "close"));
+        const nativeClose = (this.#nativeClose = native.close(remaining));
+        result = snapshotRecord(
+          await this.#withAbortlessNativeError(nativeClose.promise, "ERR_SSH_IO", "close"),
+        );
+        this.#nativeClose = null;
       } catch (cause) {
+        this.#nativeClose = null;
         const error = normalizeError(cause, "ERR_SSH_IO", "close");
         this.#native = null;
         this.#state = "closed";
@@ -2069,6 +2078,16 @@ class SSH {
 
   #wakeClose() {
     this.#closeWake?.();
+  }
+
+  #cancelNativeClose() {
+    const nativeClose = this.#nativeClose;
+    if (nativeClose === null || this.#native === null) {
+      return;
+    }
+    try {
+      this.#native.cancelOperation(nativeClose.id);
+    } catch {}
   }
 
   #startLivenessMonitor() {
