@@ -39,7 +39,16 @@ const CONNECT_TIMEOUT = Symbol("SSH connection timeout");
 const liveProcesses = new FinalizationRegistryCtor(lifecycle => {
   lifecycle.operation.signal.removeEventListener("abort", lifecycle.abortListener);
   lifecycle.operation.cleanup();
-  lifecycle.release();
+  try {
+    lifecycle.native.cancel();
+  } catch {}
+  let closed;
+  try {
+    closed = lifecycle.native.waitClosed();
+  } catch {
+    closed = Promise.resolve();
+  }
+  Promise.resolve(closed).then(lifecycle.release, lifecycle.release);
 });
 
 const configObjectKeys = [
@@ -1112,6 +1121,7 @@ class SSHProcess {
       operation,
       release,
       abortListener: this.#abortListener,
+      native,
     };
     this.#lifecycle = lifecycle;
     liveProcesses.register(this, lifecycle, lifecycle);
