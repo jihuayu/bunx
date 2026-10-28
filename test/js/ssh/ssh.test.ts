@@ -1488,7 +1488,7 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
           reader.releaseLock();
         }
 
-        expect(retained).toBeLessThanOrEqual(8 * 1024 * 1024);
+        expect(retained).toBeLessThanOrEqual(512 * 1024);
         expect(error).toBeInstanceOf(SSHError);
         expect(error).toMatchObject({
           code: "ERR_SSH_OUTPUT_LIMIT",
@@ -1502,7 +1502,7 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
   );
 
   test(
-    "connections bound aggregate buffered spawn output",
+    "spawn channels bound buffered output until the consumer catches up",
     async () => {
       const ssh = await connectedClient();
       try {
@@ -1519,21 +1519,33 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
         await Promise.all(processes.map(process => process.closed));
         const results = await Promise.all(
           processes.map(async process => {
+            const reader = process.stdout!.getReader();
+            let retained = 0;
+            let error: unknown;
             try {
-              return { bytes: (await readAll(process.stdout)).byteLength };
-            } catch (error) {
-              return { error };
+              for (;;) {
+                const result = await reader.read();
+                if (result.done) {
+                  break;
+                }
+                retained += result.value.byteLength;
+              }
+            } catch (cause) {
+              error = cause;
+            } finally {
+              reader.releaseLock();
             }
+            return { retained, error };
           }),
         );
-        const limitErrors = results.filter(
-          result =>
-            "error" in result &&
-            result.error instanceof SSHError &&
-            result.error.code === "ERR_SSH_RESOURCE_LIMIT" &&
-            result.error.phase === "io",
-        );
-        expect(limitErrors.length).toBeGreaterThan(0);
+        for (const result of results) {
+          expect(result.retained).toBeLessThanOrEqual(512 * 1024);
+          expect(result.error).toBeInstanceOf(SSHError);
+          expect(result.error).toMatchObject({
+            code: "ERR_SSH_OUTPUT_LIMIT",
+            phase: "io",
+          });
+        }
       } finally {
         await ssh.close();
       }

@@ -8,7 +8,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
 use crate::session::{ExecCancelReceiver, ExitStatus, RemoteExecution};
 
-const MAX_OUTPUT_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTPUT_STREAM_BYTES: usize = 256 * 1024;
+const MAX_CHANNEL_OUTPUT_BYTES: usize = 512 * 1024;
 pub const MAX_CONNECTION_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_QUEUE_CAPACITY: usize = 8;
 
@@ -46,6 +47,13 @@ impl OutputBudget {
         }
         *used = next;
         true
+    }
+
+    fn try_reserve_up_to(&self, bytes: usize) -> usize {
+        let mut used = self.used.lock().unwrap_or_else(|error| error.into_inner());
+        let retained = bytes.min(self.limit.saturating_sub(*used));
+        *used += retained;
+        retained
     }
 
     pub(crate) fn release(&self, bytes: usize) {
@@ -137,25 +145,28 @@ struct OutputState {
     done: bool,
     discard: bool,
     error: Option<ProcessError>,
-    budget: OutputBudget,
+    channel_budget: OutputBudget,
+    connection_budget: OutputBudget,
 }
 
 impl OutputState {
-    fn new(discard: bool, budget: OutputBudget) -> Self {
+    fn new(discard: bool, channel_budget: OutputBudget, connection_budget: OutputBudget) -> Self {
         Self {
             chunks: VecDeque::new(),
             bytes: 0,
             done: discard,
             discard,
             error: None,
-            budget,
+            channel_budget,
+            connection_budget,
         }
     }
 }
 
 impl Drop for OutputState {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        self.channel_budget.release(self.bytes);
+        self.connection_budget.release(self.bytes);
         self.bytes = 0;
     }
 }
@@ -167,10 +178,15 @@ struct OutputPipe {
 }
 
 impl OutputPipe {
-    fn new(name: &'static str, discard: bool, budget: OutputBudget) -> Self {
+    fn new(
+        name: &'static str,
+        discard: bool,
+        channel_budget: OutputBudget,
+        connection_budget: OutputBudget,
+    ) -> Self {
         Self {
             name,
-            state: AsyncMutex::new(OutputState::new(discard, budget)),
+            state: AsyncMutex::new(OutputState::new(discard, channel_budget, connection_budget)),
             changed: watch::channel(0).0,
         }
     }
@@ -192,42 +208,54 @@ impl OutputPipe {
         }
 
         let original_len = data.len();
-        let remaining = MAX_OUTPUT_STREAM_BYTES.saturating_sub(state.bytes);
-        let retained = original_len.min(remaining);
-        if retained != 0 && !state.budget.try_reserve(retained) {
-            state.done = true;
-            if state.error.is_none() {
-                state.error = Some(ProcessError::new(
-                    "ERR_SSH_RESOURCE_LIMIT",
-                    "io",
-                    format!(
-                        "SSH connection output budget of {} bytes was exceeded",
-                        state.budget.limit()
-                    ),
-                    remote_execution,
-                ));
-            }
-            drop(state);
-            self.touch();
-            return;
+        let stream_reserved = original_len.min(MAX_OUTPUT_STREAM_BYTES.saturating_sub(state.bytes));
+        let channel_reserved = state.channel_budget.try_reserve_up_to(stream_reserved);
+        let connection_reserved = state.connection_budget.try_reserve_up_to(channel_reserved);
+        if connection_reserved < channel_reserved {
+            state
+                .channel_budget
+                .release(channel_reserved - connection_reserved);
         }
+        let retained = connection_reserved;
         if retained != 0 {
             data.truncate(retained);
             state.bytes += retained;
             state.chunks.push_back(data);
         }
-        if remaining == 0 || retained < original_len {
+        if retained < original_len {
             state.done = true;
             if state.error.is_none() {
-                state.error = Some(ProcessError::new(
-                    "ERR_SSH_OUTPUT_LIMIT",
-                    "io",
-                    format!(
-                        "SSH process {} consumer did not keep up within the {}-byte buffer",
-                        self.name, MAX_OUTPUT_STREAM_BYTES
-                    ),
-                    remote_execution,
-                ));
+                state.error = Some(if connection_reserved < channel_reserved {
+                    ProcessError::new(
+                        "ERR_SSH_RESOURCE_LIMIT",
+                        "io",
+                        format!(
+                            "SSH connection output budget of {} bytes was exceeded",
+                            state.connection_budget.limit()
+                        ),
+                        remote_execution,
+                    )
+                } else if channel_reserved < stream_reserved {
+                    ProcessError::new(
+                        "ERR_SSH_OUTPUT_LIMIT",
+                        "io",
+                        format!(
+                            "SSH process output exceeded the {}-byte channel buffer",
+                            state.channel_budget.limit()
+                        ),
+                        remote_execution,
+                    )
+                } else {
+                    ProcessError::new(
+                        "ERR_SSH_OUTPUT_LIMIT",
+                        "io",
+                        format!(
+                            "SSH process {} exceeded its {}-byte output buffer",
+                            self.name, MAX_OUTPUT_STREAM_BYTES
+                        ),
+                        remote_execution,
+                    )
+                });
             }
         }
         drop(state);
@@ -250,7 +278,8 @@ impl OutputPipe {
                 } else {
                     chunk
                 };
-                state.budget.release(output.len());
+                state.channel_budget.release(output.len());
+                state.connection_budget.release(output.len());
                 drop(state);
                 self.touch();
                 return Ok(Some(output));
@@ -285,7 +314,8 @@ impl OutputPipe {
 
     async fn discard(&self) {
         let mut state = self.state.lock().await;
-        state.budget.release(state.bytes);
+        state.channel_budget.release(state.bytes);
+        state.connection_budget.release(state.bytes);
         state.chunks.clear();
         state.bytes = 0;
         state.done = true;
@@ -478,9 +508,20 @@ pub(crate) fn start_driver(
     let (cancel_sender, cancel_receiver) = watch::channel(cancelled);
     let (exit_sender, _) = watch::channel(ProcessExitState::Pending);
     let (closed_sender, _) = watch::channel(false);
+    let channel_budget = OutputBudget::with_limit(MAX_CHANNEL_OUTPUT_BYTES);
     let inner = Arc::new(ProcessInner {
-        stdout: OutputPipe::new("stdout", !config.capture_stdout, output_budget.clone()),
-        stderr: OutputPipe::new("stderr", !config.capture_stderr, output_budget),
+        stdout: OutputPipe::new(
+            "stdout",
+            !config.capture_stdout,
+            channel_budget.clone(),
+            output_budget.clone(),
+        ),
+        stderr: OutputPipe::new(
+            "stderr",
+            !config.capture_stderr,
+            channel_budget,
+            output_budget,
+        ),
         stdin: input_sender,
         cancel: cancel_sender,
         exit: exit_sender,
@@ -903,22 +944,37 @@ mod tests {
 
     #[tokio::test]
     async fn output_budget_is_released_as_output_is_consumed() {
-        let budget = OutputBudget::with_limit(4);
-        let pipe = OutputPipe::new("stdout", false, budget.clone());
+        let channel_budget = OutputBudget::with_limit(4);
+        let connection_budget = OutputBudget::with_limit(4);
+        let pipe = OutputPipe::new(
+            "stdout",
+            false,
+            channel_budget.clone(),
+            connection_budget.clone(),
+        );
 
         pipe.push(vec![1; 3], RemoteExecution::MayHaveStarted).await;
-        assert_eq!(budget.used(), 3);
+        assert_eq!(channel_budget.used(), 3);
+        assert_eq!(connection_budget.used(), 3);
         assert_eq!(pipe.read(2).await.unwrap().unwrap().len(), 2);
-        assert_eq!(budget.used(), 1);
+        assert_eq!(channel_budget.used(), 1);
+        assert_eq!(connection_budget.used(), 1);
         assert_eq!(pipe.read(2).await.unwrap().unwrap().len(), 1);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(channel_budget.used(), 0);
+        assert_eq!(connection_budget.used(), 0);
     }
 
     #[tokio::test]
     async fn output_budget_rejects_output_above_the_shared_limit() {
-        let budget = OutputBudget::with_limit(4);
-        let first = OutputPipe::new("stdout", false, budget.clone());
-        let second = OutputPipe::new("stdout", false, budget.clone());
+        let channel_budget = OutputBudget::with_limit(8);
+        let connection_budget = OutputBudget::with_limit(4);
+        let first = OutputPipe::new(
+            "stdout",
+            false,
+            channel_budget.clone(),
+            connection_budget.clone(),
+        );
+        let second = OutputPipe::new("stderr", false, channel_budget, connection_budget.clone());
 
         first
             .push(vec![1; 3], RemoteExecution::MayHaveStarted)
@@ -927,10 +983,35 @@ mod tests {
             .push(vec![2; 2], RemoteExecution::MayHaveStarted)
             .await;
 
+        assert_eq!(second.read(2).await.unwrap().unwrap().len(), 1);
         let error = second.read(2).await.unwrap_err();
         assert_eq!(error.code(), "ERR_SSH_RESOURCE_LIMIT");
-        assert_eq!(budget.used(), 3);
+        assert_eq!(connection_budget.used(), 3);
         first.discard().await;
-        assert_eq!(budget.used(), 0);
+        assert_eq!(connection_budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn channel_output_limit_is_shared_by_stdout_and_stderr() {
+        let channel_budget = OutputBudget::with_limit(4);
+        let connection_budget = OutputBudget::with_limit(16);
+        let stdout = OutputPipe::new(
+            "stdout",
+            false,
+            channel_budget.clone(),
+            connection_budget.clone(),
+        );
+        let stderr = OutputPipe::new("stderr", false, channel_budget, connection_budget);
+
+        stdout
+            .push(vec![1; 3], RemoteExecution::MayHaveStarted)
+            .await;
+        stderr
+            .push(vec![2; 2], RemoteExecution::MayHaveStarted)
+            .await;
+
+        assert_eq!(stderr.read(2).await.unwrap().unwrap().len(), 1);
+        let error = stderr.read(2).await.unwrap_err();
+        assert_eq!(error.code(), "ERR_SSH_OUTPUT_LIMIT");
     }
 }
