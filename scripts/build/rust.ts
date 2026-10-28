@@ -43,6 +43,7 @@ import { envify } from "./rust/cargo-env.ts";
 import { emitRustPlan, emitRustUnits, registerRustUnitRules } from "./rust/emit.ts";
 import { type PlanInput, planEnv, planPath, readPlan } from "./rust/plan.ts";
 import { buildRustGraph, linkedRlibs } from "./rust/units.ts";
+import { windowsSysrootIncludeDirs } from "./winsysroot.ts";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Target / profile mapping
@@ -573,6 +574,21 @@ export function cargoBuildInvocation(cfg: Config): CargoInvocation {
       const tripleEnv = triple.replace(/-/g, "_");
       unitEnv[`CFLAGS_${tripleEnv}`] = sdkFlags;
       unitEnv[`CXXFLAGS_${tripleEnv}`] = sdkFlags;
+    }
+  }
+  // Rust dependencies with C build scripts get their compiler from CC/CXX,
+  // but `/winsysroot` is a clang-cl flag: cc-rs can fall back to GNU-style
+  // clang (ring does on aarch64-pc-windows-msvc), where the flag is treated
+  // as an input path. Pass the actual MSVC/SDK includes in the target flags
+  // both modes understand.
+  if (cfg.windows && cfg.host.os !== "windows" && cfg.winsysroot !== undefined) {
+    const includeFlags = windowsSysrootIncludeDirs(cfg.winsysroot)
+      .map(dir => `-I${JSON.stringify(dir)}`)
+      .join(" ");
+    if (includeFlags.length > 0) {
+      const tripleEnv = triple.replace(/-/g, "_");
+      unitEnv[`CFLAGS_${tripleEnv}`] = includeFlags;
+      unitEnv[`CXXFLAGS_${tripleEnv}`] = includeFlags;
     }
   }
 

@@ -11,12 +11,14 @@
  * native toolchain instead.
  */
 import { describe, expect, test } from "bun:test";
-import { isWindows } from "harness";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { isWindows, tempDir } from "harness";
 
 import { resolveConfig, type Config, type PartialConfig, type Toolchain } from "../../../scripts/build/config.ts";
 import { webkit } from "../../../scripts/build/deps/webkit.ts";
 import { computeFlags } from "../../../scripts/build/flags.ts";
-import { rustTarget } from "../../../scripts/build/rust.ts";
+import { cargoBuildInvocation, rustTarget } from "../../../scripts/build/rust.ts";
 
 /** A fully-populated fake toolchain — resolveConfig never spawns any of these. */
 function mockToolchain(overrides: Partial<Toolchain> = {}): Toolchain {
@@ -155,6 +157,21 @@ describe.skipIf(isWindows)("Windows cross-compile LTO config (non-windows host)"
     const cfg = resolveWindowsCross();
     expect(rustTarget(cfg)).toBe("x86_64-pc-windows-msvc");
     expect(rustTarget(resolveWindowsCross({ arch: "aarch64" }))).toBe("aarch64-pc-windows-msvc");
+  });
+
+  test("Rust C build scripts get the MSVC and SDK include paths", async () => {
+    using dir = tempDir("bunx-winsysroot", {});
+    const root = String(dir);
+    const msvcInclude = join(root, "VC", "Tools", "MSVC", "14.44.35207", "include");
+    const sdkRoot = join(root, "Windows Kits", "10", "Include", "10.0.26100.0");
+    const sdkIncludes = ["ucrt", "shared", "um"].map(name => join(sdkRoot, name));
+    for (const path of [msvcInclude, ...sdkIncludes]) mkdirSync(path, { recursive: true });
+
+    const invocation = cargoBuildInvocation(resolveWindowsCross({ arch: "aarch64", winsysroot: root }));
+    const key = "CFLAGS_aarch64_pc_windows_msvc";
+    const expected = [msvcInclude, ...sdkIncludes].map(path => `-I${JSON.stringify(path)}`).join(" ");
+    expect(invocation.unitEnv[key]).toBe(expected);
+    expect(invocation.unitEnv.CXXFLAGS_aarch64_pc_windows_msvc).toBe(expected);
   });
 
   test("linux LTO config uses ThinLTO with WPD and no-split-lto-unit", () => {

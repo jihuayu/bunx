@@ -40,6 +40,7 @@ import { emitShims, machoPostlinkCommand, machoPostlinkImplicitInputs } from "./
 import { resolveDep, type Dependency, type DepName, type ResolvedDep } from "./source.ts";
 import { streamPath } from "./stream.ts";
 import { generateUnifiedSources } from "./unified.ts";
+import { windowsSysrootIncludeDirs } from "./winsysroot.ts";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Executable naming
@@ -915,36 +916,6 @@ function emitWindowsResources(n: Ninja, cfg: Config): string {
   });
 
   return resFile;
-}
-
-/**
- * Include dirs inside an xwin-style Windows sysroot, for tools that don't
- * understand `/winsysroot` themselves (llvm-rc). Layout:
- *   <root>/VC/Tools/MSVC/<ver>/include
- *   <root>/Windows Kits/10/Include/<sdkver>/{ucrt,shared,um}
- * The SDK "Include" dir is title-case in a real VS/SDK copy and lowercase
- * in an xwin winsysroot-style splat — accept either.
- */
-function windowsSysrootIncludeDirs(winsysroot: string): string[] {
-  const dirs: string[] = [];
-  const msvcRoot = resolve(winsysroot, "VC", "Tools", "MSVC");
-  if (existsSync(msvcRoot)) {
-    for (const ver of readdirSync(msvcRoot)) {
-      const d = resolve(msvcRoot, ver, "include");
-      if (existsSync(d)) dirs.push(d);
-    }
-  }
-  const sdkRoot = resolve(winsysroot, "Windows Kits", "10");
-  const sdkInclude = ["Include", "include"].map(name => resolve(sdkRoot, name)).find(existsSync);
-  if (sdkInclude !== undefined) {
-    for (const ver of readdirSync(sdkInclude)) {
-      for (const sub of ["ucrt", "shared", "um"]) {
-        const d = resolve(sdkInclude, ver, sub);
-        if (existsSync(d)) dirs.push(d);
-      }
-    }
-  }
-  return dirs;
 }
 
 /**

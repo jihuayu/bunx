@@ -83,6 +83,34 @@ function listDir(dir: string): string[] {
   }
 }
 
+/**
+ * Include directories inside an xwin-style sysroot, for tools and build
+ * scripts that don't understand `/winsysroot` themselves. The SDK directory
+ * is title-case in a real Visual Studio/SDK install and lowercase in xwin's
+ * winsysroot-style layout.
+ */
+export function windowsSysrootIncludeDirs(winsysroot: string): string[] {
+  const dirs: string[] = [];
+  const msvcRoot = join(winsysroot, "VC", "Tools", "MSVC");
+  for (const ver of listDir(msvcRoot)) {
+    const dir = join(msvcRoot, ver, "include");
+    if (existsSync(dir)) dirs.push(dir);
+  }
+
+  const sdkRoot = join(winsysroot, "Windows Kits", "10");
+  const sdkInclude = joinIgnoreCase(sdkRoot, "Include");
+  if (sdkInclude !== undefined) {
+    for (const ver of listDir(sdkInclude)) {
+      for (const sub of ["ucrt", "shared", "um"]) {
+        const dir = join(sdkInclude, ver, sub);
+        if (existsSync(dir)) dirs.push(dir);
+      }
+    }
+  }
+
+  return dirs;
+}
+
 /** MS arch notation used for per-arch lib dirs inside the SDK. */
 function msArchName(arch: Arch): string {
   return arch === "x64" ? "x64" : "arm64";
