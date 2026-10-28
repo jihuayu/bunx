@@ -94,6 +94,16 @@
       "JSBundleCompletionTask"
     ]
   },
+  "src/runtime/api/ssh_jsc.rs": {
+    "unsafe impl Send": [
+      "AuthJob",
+      "CloseJob",
+      "ConnectJob",
+      "ExecJob",
+      "ProcessJob",
+      "StartProcessJob"
+    ]
+  },
   "src/runtime/bake/production/mod.rs": {
     "unsafe impl Sync": [
       "DotenvSingleton"

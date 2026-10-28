@@ -680,8 +680,8 @@ struct ProcessJob {
     result: Option<Result<ProcessResult, ProcessError>>,
 }
 
-// SAFETY: the process handle owns only thread-safe channel state, and its ref
-// keeps that state alive while the job runs.
+// SAFETY: the process handle owns only thread-safe channel state, its ref keeps
+// that state alive while the job runs, and bun_jsc::Job carries the VM ticket.
 unsafe impl Send for ProcessJob {}
 
 impl JobContext for ProcessJob {
@@ -793,8 +793,9 @@ struct StartProcessJob {
     result: Option<Result<BlockingProcess, ExecError>>,
 }
 
-// SAFETY: every field is owned or thread-safe. The connection ref keeps the
-// transport alive while the channel is opened and exec is acknowledged.
+// SAFETY: every field is owned or thread-safe, the connection ref keeps the
+// transport alive while the channel is opened and exec is acknowledged, and
+// bun_jsc::Job carries the VM ticket.
 unsafe impl Send for StartProcessJob {}
 
 impl JobContext for StartProcessJob {
@@ -844,8 +845,9 @@ impl JobContext for StartProcessJob {
     }
 }
 
-// SAFETY: every field is owned or thread-safe. The ref keeps the connection
-// payload alive while the channel operation runs.
+// SAFETY: every field is owned or thread-safe, the ref keeps the connection
+// payload alive while the channel operation runs, and bun_jsc::Job carries the
+// VM ticket.
 unsafe impl Send for ExecJob {}
 
 impl JobContext for ExecJob {
@@ -888,8 +890,9 @@ impl JobContext for ExecJob {
     }
 }
 
-// SAFETY: every field is owned or thread-safe. The ref keeps the connection
-// payload alive while the job is off the JS thread.
+// SAFETY: every field is owned or thread-safe, the ref keeps the connection
+// payload alive while the job is off the JS thread, and bun_jsc::Job carries the
+// VM ticket.
 unsafe impl Send for ConnectJob {}
 
 #[derive(JsAffine)]
@@ -938,8 +941,8 @@ struct AuthJob {
     result: Option<Result<(), AuthError>>,
 }
 
-// SAFETY: the authentication payload is owned and the ref keeps the
-// thread-safe connection alive while the job runs.
+// SAFETY: the authentication payload is owned, the ref keeps the thread-safe
+// connection alive while the job runs, and bun_jsc::Job carries the VM ticket.
 unsafe impl Send for AuthJob {}
 
 impl JobContext for AuthJob {
@@ -989,8 +992,8 @@ struct CloseJob {
     result: Option<Result<CloseResult, CloseError>>,
 }
 
-// SAFETY: every field is owned or thread-safe. The ref keeps the connection
-// payload alive while close runs.
+// SAFETY: every field is owned or thread-safe, the ref keeps the connection
+// payload alive while close runs, and bun_jsc::Job carries the VM ticket.
 unsafe impl Send for CloseJob {}
 
 impl JobContext for CloseJob {
