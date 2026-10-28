@@ -80,6 +80,7 @@ impl ConnectError {
 #[derive(Debug)]
 pub enum AuthError {
     Timeout,
+    Aborted,
     Rejected,
     InvalidKey(String),
     Protocol(String),
@@ -90,6 +91,7 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => f.write_str("SSH authentication timed out"),
+            Self::Aborted => f.write_str("SSH authentication was aborted"),
             Self::Rejected => f.write_str("SSH authentication was rejected"),
             Self::InvalidKey(message) => write!(f, "invalid SSH private key: {message}"),
             Self::Protocol(message) => write!(f, "SSH authentication error: {message}"),
@@ -104,6 +106,7 @@ impl AuthError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Timeout => "ERR_SSH_AUTH_TIMEOUT",
+            Self::Aborted => "ERR_SSH_ABORTED",
             Self::Rejected | Self::InvalidKey(_) => "ERR_SSH_AUTH",
             Self::Protocol(_) => "ERR_SSH_PROTOCOL",
             Self::ConnectionLost => "ERR_SSH_CONNECTION_LOST",
@@ -444,6 +447,25 @@ impl BlockingSession {
             .unwrap_or_else(|error| error.into_inner());
         self.runtime
             .block_on(session.authenticate_with(auth, username, authentication_timeout_ms))
+    }
+
+    pub fn authenticate_with_cancel(
+        &self,
+        auth: &Auth,
+        username: &str,
+        authentication_timeout_ms: u64,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(), AuthError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.runtime.block_on(session.authenticate_with_cancel(
+            auth,
+            username,
+            authentication_timeout_ms,
+            cancel,
+        ))
     }
 
     pub fn close_with_timeout(&self, grace_period: Duration) -> Result<CloseResult, CloseError> {
@@ -1225,6 +1247,37 @@ impl Session {
             Err(AuthError::Rejected)
         }
     }
+
+    pub async fn authenticate_with_cancel(
+        &self,
+        auth: &Auth,
+        username: &str,
+        authentication_timeout_ms: u64,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(), AuthError> {
+        if *cancel.borrow() {
+            return Err(AuthError::Aborted);
+        }
+        let mut slot = self.inner.handle.lock().await;
+        let handle = slot
+            .as_mut()
+            .ok_or_else(|| AuthError::Protocol("SSH session is closed".into()))?;
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => Err(AuthError::Aborted),
+            result = tokio::time::timeout(
+                Duration::from_millis(authentication_timeout_ms),
+                authenticate_inner(handle, auth, username),
+            ) => {
+                let result = result.map_err(|_| AuthError::Timeout)??;
+                if result.success() {
+                    Ok(())
+                } else {
+                    Err(AuthError::Rejected)
+                }
+            }
+        }
+    }
 }
 
 async fn authenticate_inner(
@@ -1313,12 +1366,19 @@ mod tests {
     struct TestServer {
         attempts: Arc<AtomicUsize>,
         channel_gate: Option<Arc<ChannelGate>>,
+        auth_gate: Option<Arc<AuthGate>>,
     }
 
     struct ChannelGate {
         opened: tokio::sync::Notify,
         release: tokio::sync::Notify,
         opens: AtomicUsize,
+    }
+
+    struct AuthGate {
+        opened: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        entered: std::sync::atomic::AtomicBool,
     }
 
     impl server::Server for TestServer {
@@ -1328,6 +1388,7 @@ mod tests {
             TestHandler {
                 attempts: Arc::clone(&self.attempts),
                 channel_gate: self.channel_gate.clone(),
+                auth_gate: self.auth_gate.clone(),
             }
         }
     }
@@ -1335,6 +1396,7 @@ mod tests {
     struct TestHandler {
         attempts: Arc<AtomicUsize>,
         channel_gate: Option<Arc<ChannelGate>>,
+        auth_gate: Option<Arc<AuthGate>>,
     }
 
     impl server::Handler for TestHandler {
@@ -1362,6 +1424,12 @@ mod tests {
             password: &str,
         ) -> Result<ServerAuth, Self::Error> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.auth_gate {
+                if !gate.entered.swap(true, Ordering::SeqCst) {
+                    gate.opened.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             Ok(if user == USERNAME && password == PASSWORD {
                 ServerAuth::Accept
             } else {
@@ -1434,8 +1502,9 @@ mod tests {
         }
     }
 
-    async fn start_server_with_channel_gate(
+    async fn start_server_with_gates(
         channel_gate: Option<Arc<ChannelGate>>,
+        auth_gate: Option<Arc<AuthGate>>,
     ) -> RunningServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1456,6 +1525,7 @@ mod tests {
         let mut server = TestServer {
             attempts: Arc::clone(&attempts),
             channel_gate: channel_gate.clone(),
+            auth_gate: auth_gate.clone(),
         };
         let task = tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -1469,7 +1539,7 @@ mod tests {
     }
 
     async fn start_server() -> RunningServer {
-        start_server_with_channel_gate(None).await
+        start_server_with_gates(None, None).await
     }
 
     struct BlockingServer {
@@ -1503,6 +1573,7 @@ mod tests {
         let mut server = TestServer {
             attempts,
             channel_gate: None,
+            auth_gate: None,
         };
         runtime.spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -1740,7 +1811,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
             opens: AtomicUsize::new(0),
         });
-        let server = start_server_with_channel_gate(Some(Arc::clone(&gate))).await;
+        let server = start_server_with_gates(Some(Arc::clone(&gate)), None).await;
         let config = config(&server, known_hosts(&server), password_auth());
         let session = connect(&config).await.unwrap();
         session.authenticate(&config).await.unwrap();
@@ -1774,6 +1845,41 @@ mod tests {
             .unwrap();
         assert_eq!(result.stdout, b"ok");
         assert_eq!(result.exit_status, ExitStatus::Exit { code: 0 });
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_cancellation_interrupts_a_stalled_server() {
+        let gate = Arc::new(AuthGate {
+            opened: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            entered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let server = start_server_with_gates(None, Some(Arc::clone(&gate))).await;
+        let config = config(&server, known_hosts(&server), password_auth());
+        let session = connect(&config).await.unwrap();
+
+        let (cancel_sender, cancel) = exec_cancellation();
+        let task_session = session.clone();
+        let auth = password_auth();
+        let task = tokio::spawn(async move {
+            task_session
+                .authenticate_with_cancel(&auth, USERNAME, 30_000, cancel)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), gate.opened.notified())
+            .await
+            .expect("server did not receive the authentication request");
+        cancel_sender.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled authentication did not settle")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, AuthError::Aborted));
+
+        gate.release.notify_one();
         session.close().await.unwrap();
     }
 

@@ -158,7 +158,12 @@ impl SSHConnection {
         Ok(info)
     }
 
-    fn authenticate(&self, auth: &Auth, timeout_ms: u64) -> Result<(), AuthError> {
+    fn authenticate(
+        &self,
+        auth: &Auth,
+        timeout_ms: u64,
+        cancel: ExecCancelReceiver,
+    ) -> Result<(), AuthError> {
         let session = self
             .session
             .lock()
@@ -166,7 +171,7 @@ impl SSHConnection {
             .as_ref()
             .cloned()
             .ok_or_else(|| AuthError::Protocol("SSH session is closed".into()))?;
-        session.authenticate_with(auth, &self.config.username, timeout_ms)
+        session.authenticate_with_cancel(auth, &self.config.username, timeout_ms, cancel)
     }
 
     fn close_session(&self, grace_period_ms: u64) -> Result<CloseResult, CloseError> {
@@ -412,6 +417,7 @@ impl SSHConnection {
         auth: Auth,
         timeout_ms: u64,
     ) -> bindgen::Result<'a, JSValue> {
+        let (operation_id, cancel) = self.begin_operation();
         let promise = JSPromiseStrong::init(cx.global());
         let value = promise.value();
         Job::<AuthJob>::schedule(
@@ -420,8 +426,10 @@ impl SSHConnection {
                 connection: unsafe {
                     bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut())
                 },
+                operation_id,
                 auth: Some(auth),
                 timeout_ms,
+                cancel,
                 result: None,
             },
             promise,
@@ -807,8 +815,10 @@ impl JobContext for ConnectJob {
 
 struct AuthJob {
     connection: bun_ptr::RefPtr<SSHConnection>,
+    operation_id: u64,
     auth: Option<Auth>,
     timeout_ms: u64,
+    cancel: ExecCancelReceiver,
     result: Option<Result<(), AuthError>>,
 }
 
@@ -822,7 +832,10 @@ impl JobContext for AuthJob {
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
         let auth = this.auth.take().expect("authentication request");
-        this.result = Some(this.connection.authenticate(&auth, this.timeout_ms));
+        this.result = Some(
+            this.connection
+                .authenticate(&auth, this.timeout_ms, this.cancel.clone()),
+        );
         Some(done)
     }
 
@@ -831,6 +844,7 @@ impl JobContext for AuthJob {
         mut promise: JSPromiseStrong,
         cx: &bun_jsc::JsThread<'_>,
     ) -> JsResult<()> {
+        this.connection.finish_operation(this.operation_id);
         let global = cx.global();
         match this.result.take().expect("authentication result") {
             Ok(()) => promise.resolve(global, JSValue::UNDEFINED),
