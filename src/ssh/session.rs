@@ -1373,6 +1373,11 @@ mod tests {
                     session.data(channel, "partial")?;
                     session.disconnect(Disconnect::ByApplication, "", "")?;
                 }
+                b"signal-status" => {
+                    session.exit_signal_request(channel, Sig::TERM, true, "", "")?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
                 _ => {
                     session.channel_failure(channel)?;
                 }
@@ -1747,6 +1752,26 @@ mod tests {
         assert_eq!(error.phase(), "io");
         assert_eq!(error.remote_execution(), RemoteExecution::MayHaveStarted);
         process.wait_closed();
+    }
+
+    #[test]
+    fn preserves_a_server_exit_signal_and_core_dump_flag() {
+        let server = start_blocking_server();
+        let session = blocking_session(&server);
+        let (_cancel_sender, cancel) = exec_cancellation();
+
+        let result = session
+            .exec_with_cancel(b"signal-status".to_vec(), Vec::new(), None, 1024, cancel)
+            .unwrap();
+        assert_eq!(
+            result.exit_status,
+            ExitStatus::Signal {
+                signal: "TERM".into(),
+                core_dumped: true,
+            }
+        );
+        assert_eq!(result.remote_execution, RemoteExecution::ExitObserved);
+        session.close_with_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[tokio::test]

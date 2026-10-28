@@ -870,6 +870,18 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("exec preserves exit code 255", async () => {
+    const ssh = await connectedClient();
+    try {
+      const result = await ssh.exec("exit 255");
+      expect(result.status).toEqual({ type: "exit", code: 255 });
+      expect(result.exitCode).toBe(255);
+      expect(result.remoteExecution).toBe("exit-observed");
+    } finally {
+      await ssh.close();
+    }
+  });
+
   test("exec sends binary stdin and resolves JSON without replaying the command", async () => {
     const ssh = await connectedClient();
     try {
@@ -892,6 +904,31 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
       expect(exact.text()).toBe("12345");
 
       const error = await ssh.exec("printf '123456'", { maxOutputBytes: 5 }).catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_OUTPUT_LIMIT",
+        phase: "exec",
+      });
+      expect(error.stdout.byteLength + error.stderr.byteLength).toBeLessThanOrEqual(5);
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec applies one byte budget across stdout and stderr", async () => {
+    const ssh = await connectedClient();
+    try {
+      const exact = await ssh.exec("printf '123'; printf '45' >&2", {
+        maxOutputBytes: 5,
+      });
+      expect(exact.stdout).toEqual(new TextEncoder().encode("123"));
+      expect(exact.stderr).toEqual(new TextEncoder().encode("45"));
+
+      const error = await ssh
+        .exec("printf '123'; printf '456' >&2", {
+          maxOutputBytes: 5,
+        })
+        .catch(error => error);
       expect(error).toBeInstanceOf(SSHError);
       expect(error).toMatchObject({
         code: "ERR_SSH_OUTPUT_LIMIT",
