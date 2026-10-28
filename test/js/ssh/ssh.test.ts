@@ -495,6 +495,34 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     return ssh;
   }
 
+  async function terminateWorkerWhenReady(source: string) {
+    const workerUrl = URL.createObjectURL(
+      new Blob([source], {
+        type: "application/javascript",
+      }),
+    );
+    const worker = new Worker(workerUrl);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker.addEventListener("message", event => {
+          if (event.data === "ready") {
+            resolve();
+          }
+        });
+        worker.addEventListener("error", event => {
+          reject(event.error ?? new Error(event.message));
+        });
+      });
+
+      const started = performance.now();
+      await worker.terminate();
+      expect(performance.now() - started).toBeLessThan(1_000);
+    } finally {
+      await worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+    }
+  }
+
   beforeAll(async () => {
     dir = tempDir("bun-ssh-connection", {});
     port = reservePort();
@@ -926,6 +954,37 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
       }
       listener.stop(true);
     }
+  });
+
+  test("worker termination cancels in-flight exec and spawn jobs", async () => {
+    const knownHostsText = await knownHosts.text();
+    const privateKeyText = await privateKey.text();
+    const clientSource = `
+      const ssh = new Bun.SSH({
+        hostname: "127.0.0.1",
+        port: ${port},
+        username: ${JSON.stringify(username)},
+        hostKey: { type: "knownHosts", file: new Blob([${JSON.stringify(knownHostsText)}]) },
+        auth: {
+          type: "privateKey",
+          key: new TextEncoder().encode(${JSON.stringify(privateKeyText)}),
+        },
+        connectTimeoutMs: 5_000,
+        authenticationTimeoutMs: 5_000,
+      });
+      await ssh.connect();
+    `;
+
+    await terminateWorkerWhenReady(
+      `${clientSource}
+       ssh.exec("sleep 60", { timeoutMs: 0 }).catch(() => {});
+       postMessage("ready");`,
+    );
+    await terminateWorkerWhenReady(
+      `${clientSource}
+       await ssh.spawn("sleep 60", { stdout: "ignore", stderr: "ignore" });
+       postMessage("ready");`,
+    );
   });
 
   test("connect timeout reports the native handshake phase", async () => {
