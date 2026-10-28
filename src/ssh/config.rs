@@ -38,10 +38,19 @@ impl fmt::Debug for KnownHostsSource {
 }
 
 /// A secret accepted by the SSH authentication protocol.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Secret {
     Text(String),
     Bytes(Vec<u8>),
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(_) => f.write_str("Text([REDACTED])"),
+            Self::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+        }
+    }
 }
 
 impl Secret {
@@ -56,13 +65,26 @@ impl Secret {
 }
 
 /// The explicit authentication method. There is intentionally no fallback.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Auth {
     Password(Secret),
     PrivateKey {
         key: Vec<u8>,
         passphrase: Option<Secret>,
     },
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Password(secret) => f.debug_tuple("Password").field(secret).finish(),
+            Self::PrivateKey { key, passphrase } => f
+                .debug_struct("PrivateKey")
+                .field("key_len", &key.len())
+                .field("passphrase", passphrase)
+                .finish(),
+        }
+    }
 }
 
 /// Validated, owned SSH configuration.
@@ -186,4 +208,27 @@ fn validate_text(value: &str, name: &'static str) -> Result<(), &'static str> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_debug_output_redacts_secrets() {
+        let password = Auth::Password(Secret::Text("password-sentinel".into()));
+        let password_debug = format!("{password:?}");
+        assert!(!password_debug.contains("password-sentinel"));
+        assert!(password_debug.contains("REDACTED"));
+
+        let private_key = Auth::PrivateKey {
+            key: b"private-key-sentinel".to_vec(),
+            passphrase: Some(Secret::Bytes(b"passphrase-sentinel".to_vec())),
+        };
+        let private_key_debug = format!("{private_key:?}");
+        assert!(!private_key_debug.contains("private-key-sentinel"));
+        assert!(!private_key_debug.contains("passphrase-sentinel"));
+        assert!(private_key_debug.contains("key_len: 20"));
+        assert!(private_key_debug.contains("Bytes(19)"));
+    }
 }
