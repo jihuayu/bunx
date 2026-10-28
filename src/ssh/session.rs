@@ -412,6 +412,13 @@ impl BlockingSession {
             .clone()
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_closed()
+    }
+
     pub fn authenticate_with(
         &self,
         auth: &Auth,
@@ -481,10 +488,9 @@ impl Session {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner
-            .handle
-            .try_lock()
-            .map_or(false, |handle| handle.is_none())
+        self.inner.handle.try_lock().map_or(false, |handle| {
+            handle.as_ref().map_or(true, |handle| handle.is_closed())
+        })
     }
 
     pub async fn close(&self) -> Result<CloseResult, CloseError> {

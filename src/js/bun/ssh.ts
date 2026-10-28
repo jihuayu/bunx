@@ -23,6 +23,7 @@ const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
 const MAX_COMMAND_BYTES = 64 * 1024;
 const MAX_EXEC_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_PROCESS_CHUNK_BYTES = 64 * 1024;
+const LIVENESS_CHECK_INTERVAL_MS = 500;
 const EMPTY_BYTES = new Uint8Array();
 const NativeSSHConnection = $bindgen("ssh_jsc.bind.ts", "SSHConnection");
 const textEncoder = new TextEncoder();
@@ -786,6 +787,10 @@ function nativeRemoteExecution(value: unknown): string {
   return value === "may-have-started" || value === "exit-observed" || value === "not-started" ? value : "not-started";
 }
 
+function isConnectionLost(error: SSHError): boolean {
+  return error.code === "ERR_SSH_CONNECTION_LOST";
+}
+
 function snapshotProcessSignal(value: unknown): string {
   if (typeof value !== "string" || processSignals.indexOf(value) === -1) {
     configError(`SSH signal must be one of ${processSignals.join(", ")}`);
@@ -961,7 +966,7 @@ class SSHProcess {
   #cancelPromise = null;
   #abortListener;
 
-  constructor(native, options, operation, release) {
+  constructor(native, options, operation, release, connectionLost) {
     this.#native = native;
     this.#stdin = options.stdinMode === "pipe" ? processStdin(native) : null;
     this.#stdout = options.captureStdout ? processStream(native, "stdout", operation) : null;
@@ -986,6 +991,9 @@ class SSHProcess {
         const error = normalizeError(cause, "ERR_SSH_IO", "io");
         if (error.code === "ERR_SSH_ABORTED" && operation.signal.aborted) {
           throw abortError(operation.signal, "exec");
+        }
+        if (isConnectionLost(error)) {
+          connectionLost(error);
         }
         throw error;
       },
@@ -1111,6 +1119,7 @@ class SSH {
   #closeDeadline = 0;
   #closeForceRequested = false;
   #closeWake = null;
+  #livenessTimer = null;
 
   constructor(options: unknown) {
     const source = requireRecord(options, "options");
@@ -1339,12 +1348,17 @@ class SSH {
         throw abortError(signal, "exec");
       }
 
-      const process = new SSHProcess(nativeProcess, options, operation, release);
+      const process = new SSHProcess(nativeProcess, options, operation, release, error => {
+        this.#markPeerClosed(error);
+      });
       transferred = true;
       release = null;
       return process;
     } catch (error) {
       const normalized = normalizeError(error, "ERR_SSH_IO", "exec");
+      if (isConnectionLost(normalized)) {
+        this.#markPeerClosed(normalized);
+      }
       throw operationId === "" ? normalized : retagOperation(normalized, operationId);
     } finally {
       if (!transferred) {
@@ -1479,6 +1493,9 @@ class SSH {
       return result;
     } catch (error) {
       const normalized = normalizeError(error, "ERR_SSH_IO", "exec");
+      if (isConnectionLost(normalized)) {
+        this.#markPeerClosed(normalized);
+      }
       throw operationId === "" ? normalized : retagOperation(normalized, operationId);
     } finally {
       operation.cleanup();
@@ -1676,6 +1693,7 @@ class SSH {
 
       this.#info = snapshotRecord(info);
       this.#state = "ready";
+      this.#startLivenessMonitor();
     } catch (cause) {
       let error = normalizeError(cause, "ERR_SSH_CONNECT", "handshake");
       if (native !== null) {
@@ -1777,6 +1795,7 @@ class SSH {
     }
 
     this.#state = "closing";
+    this.#stopLivenessMonitor();
     this.#closeForceRequested = closeOptions.force;
     this.#closeDeadline = performance.now() + closeOptions.gracePeriodMs;
     this.#rejectQueued(
@@ -1862,6 +1881,55 @@ class SSH {
 
   #wakeClose() {
     this.#closeWake?.();
+  }
+
+  #startLivenessMonitor() {
+    this.#stopLivenessMonitor();
+    const check = () => {
+      this.#livenessTimer = null;
+      if (this.#state !== "ready" || this.#native === null) {
+        return;
+      }
+      let closed = false;
+      try {
+        closed = this.#native.isClosed();
+      } catch {}
+      if (closed) {
+        this.#markPeerClosed();
+        return;
+      }
+      const timer = setTimeout(check, LIVENESS_CHECK_INTERVAL_MS);
+      timer.unref?.();
+      this.#livenessTimer = timer;
+    };
+    const timer = setTimeout(check, LIVENESS_CHECK_INTERVAL_MS);
+    timer.unref?.();
+    this.#livenessTimer = timer;
+  }
+
+  #stopLivenessMonitor() {
+    if (this.#livenessTimer !== null) {
+      clearTimeout(this.#livenessTimer);
+      this.#livenessTimer = null;
+    }
+  }
+
+  #markPeerClosed(error?) {
+    if (this.#state !== "ready") {
+      return;
+    }
+    this.#stopLivenessMonitor();
+    this.#state = "closed";
+    this.#native = null;
+    this.#rejectQueued(
+      new SSHError("SSH connection was lost", {
+        code: "ERR_SSH_CONNECTION_LOST",
+        phase: "io",
+        remoteExecution: "not-started",
+        cause: error,
+      }),
+    );
+    this.#settleClosed({ reason: "peer", forced: false });
   }
 
   async #withAbortlessNativeError(value, code: string, phase: string) {

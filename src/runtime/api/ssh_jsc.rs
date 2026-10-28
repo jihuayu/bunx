@@ -118,6 +118,14 @@ impl SSHConnection {
         Ok(value)
     }
 
+    pub(crate) fn is_closed(&self, _cx: &mut JsScope<'_>) -> bool {
+        self.session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(true, BlockingSession::is_closed)
+    }
+
     fn connect(&self, config: &TransportConfig) -> Result<ConnectionInfo, ConnectError> {
         {
             let slot = self

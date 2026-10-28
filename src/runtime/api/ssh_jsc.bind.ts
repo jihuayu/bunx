@@ -32,6 +32,11 @@ export const SSHConnection = b.class({
       capability: "js",
       throws: true,
     },
+    isClosed: {
+      returns: b.bool,
+      capability: "js",
+      throws: false,
+    },
     authenticatePassword: {
       args: {
         password: b.bytes({ from: ["buffer"], held: "copied" }),

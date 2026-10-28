@@ -1270,4 +1270,34 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
       await ssh.close();
     }
   });
+
+  test("observes a peer disconnect and settles the terminal state", async () => {
+    const victim = await connectedClient();
+    const killer = await connectedClient();
+    try {
+      const serverPid = (await victim.exec("printf '%s' $PPID")).text();
+      expect(serverPid).toMatch(/^\d+$/);
+
+      await killer.exec(`kill -KILL ${serverPid}`);
+      expect(await victim.closed).toEqual({ reason: "peer", forced: false });
+      expect(victim.state).toBe("closed");
+      expect(await victim.close()).toEqual({ forced: false });
+      await expect(victim.exec("true")).rejects.toMatchObject({
+        code: "ERR_SSH_CLOSED",
+        phase: "exec",
+      });
+      expect((await killer.exec("printf still-ready")).text()).toBe("still-ready");
+    } finally {
+      await killer.close();
+    }
+  });
+
+  test("channel connection loss marks the parent connection terminal", async () => {
+    const ssh = await connectedClient();
+    const error = await ssh.exec("kill -KILL $PPID", { timeoutMs: 0 }).catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error.code).toBe("ERR_SSH_CONNECTION_LOST");
+    expect(await ssh.closed).toEqual({ reason: "peer", forced: false });
+    expect(ssh.state).toBe("closed");
+  });
 });
