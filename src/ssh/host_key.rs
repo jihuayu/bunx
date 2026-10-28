@@ -69,6 +69,7 @@ impl KnownHosts {
         };
         let fingerprint = fingerprint(key);
         let mut matched_host = false;
+        let mut accepted = false;
         let mut changed_line = None;
 
         for (index, raw_line) in self.source.split(|byte| *byte == b'\n').enumerate() {
@@ -139,11 +140,13 @@ impl KnownHosts {
                 changed_line.get_or_insert(line_number);
             }
             if known.key_data() == key.key_data() {
-                return Ok(());
+                accepted = true;
             }
         }
 
-        if matched_host {
+        if accepted {
+            Ok(())
+        } else if matched_host {
             Err(HostKeyError::Changed {
                 line: changed_line.unwrap_or(0),
                 fingerprint,
@@ -395,6 +398,24 @@ mod tests {
             known.verify("localhost", 22, &key),
             Err(HostKeyError::Revoked {
                 line: 1,
+                fingerprint: fingerprint(&key),
+            })
+        );
+    }
+
+    #[test]
+    fn revoked_entries_override_earlier_trusted_matches() {
+        let key = test_key();
+        let source = format!(
+            "localhost {}\n@revoked localhost {}\n",
+            public_key_fields(&key),
+            public_key_fields(&key)
+        );
+        let known = KnownHosts::new(source.into_bytes());
+        assert_eq!(
+            known.verify("localhost", 22, &key),
+            Err(HostKeyError::Revoked {
+                line: 2,
                 fingerprint: fingerprint(&key),
             })
         );
