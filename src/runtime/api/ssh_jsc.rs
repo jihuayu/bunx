@@ -102,6 +102,7 @@ impl SSHConnection {
         &self,
         cx: &mut JsScope<'a>,
     ) -> bindgen::Result<'a, JSValue> {
+        let (operation_id, cancel) = self.begin_operation();
         let promise = JSPromiseStrong::init(cx.global());
         let value = promise.value();
         Job::<ConnectJob>::schedule(
@@ -111,6 +112,8 @@ impl SSHConnection {
                     bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut())
                 },
                 config: self.config.clone(),
+                operation_id,
+                cancel,
                 result: None,
             },
             ConnectJs { promise },
@@ -126,7 +129,11 @@ impl SSHConnection {
             .map_or(true, BlockingSession::is_closed)
     }
 
-    fn connect(&self, config: &TransportConfig) -> Result<ConnectionInfo, ConnectError> {
+    fn connect(
+        &self,
+        config: &TransportConfig,
+        cancel: ExecCancelReceiver,
+    ) -> Result<ConnectionInfo, ConnectError> {
         {
             let slot = self
                 .session
@@ -139,9 +146,16 @@ impl SSHConnection {
         if self.close_requested.load(Ordering::Acquire) {
             return Err(ConnectError::Io("tcp", "connection was closed".into()));
         }
+        if *cancel.borrow() {
+            return Err(ConnectError::Aborted("handshake"));
+        }
 
-        let session = BlockingSession::connect_transport(config)?;
+        let session = BlockingSession::connect_transport_with_cancel(config, cancel.clone())?;
         let info = session.info();
+        if *cancel.borrow() {
+            let _ = session.close_with_timeout(std::time::Duration::ZERO);
+            return Err(ConnectError::Aborted("handshake"));
+        }
         let mut slot = self
             .session
             .lock()
@@ -174,7 +188,19 @@ impl SSHConnection {
         session.authenticate_with_cancel(auth, &self.config.username, timeout_ms, cancel)
     }
 
-    fn close_session(&self, grace_period_ms: u64) -> Result<CloseResult, CloseError> {
+    fn close_session_with_cancel(
+        &self,
+        grace_period_ms: u64,
+        cancel: ExecCancelReceiver,
+    ) -> Result<CloseResult, CloseError> {
+        self.close_session_optional_cancel(grace_period_ms, Some(cancel))
+    }
+
+    fn close_session_optional_cancel(
+        &self,
+        grace_period_ms: u64,
+        cancel: Option<ExecCancelReceiver>,
+    ) -> Result<CloseResult, CloseError> {
         self.close_requested.store(true, Ordering::Release);
         self.cancel_all_operations();
         let mut slot = self
@@ -184,7 +210,15 @@ impl SSHConnection {
         let Some(session) = slot.take() else {
             return Ok(CloseResult { forced: false });
         };
-        session.close_with_timeout(std::time::Duration::from_millis(grace_period_ms))
+        let grace_period = if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_millis(grace_period_ms)
+        };
+        match cancel {
+            Some(cancel) => session.close_with_timeout_cancel(grace_period, cancel),
+            None => session.close_with_timeout(grace_period),
+        }
     }
 
     fn begin_operation(&self) -> (u64, ExecCancelReceiver) {
@@ -442,6 +476,7 @@ impl SSHConnection {
         cx: &mut JsScope<'a>,
         grace_period_ms: u64,
     ) -> bindgen::Result<'a, JSValue> {
+        let (cancel_sender, cancel) = exec_cancellation();
         let promise = JSPromiseStrong::init(cx.global());
         let value = promise.value();
         Job::<CloseJob>::schedule(
@@ -451,6 +486,8 @@ impl SSHConnection {
                     bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut())
                 },
                 grace_period_ms,
+                cancel_sender,
+                cancel,
                 result: None,
             },
             promise,
@@ -606,6 +643,7 @@ unsafe impl Send for ProcessJob {}
 impl JobContext for ProcessJob {
     type OffThread = Self;
     type Js = JSPromiseStrong;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
         let process = &this.process.process;
@@ -638,6 +676,13 @@ impl JobContext for ProcessJob {
             }
         });
         Some(done)
+    }
+
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: the live off-thread half remains valid for the duration of
+        // this call, and BlockingProcess::cancel only touches thread-safe state.
+        let job = unsafe { &*off };
+        job.process.process.cancel();
     }
 
     fn then(
@@ -678,6 +723,8 @@ impl JobContext for ProcessJob {
 struct ConnectJob {
     connection: bun_ptr::RefPtr<SSHConnection>,
     config: TransportConfig,
+    operation_id: u64,
+    cancel: ExecCancelReceiver,
     result: Option<Result<ConnectionInfo, ConnectError>>,
 }
 
@@ -709,6 +756,7 @@ unsafe impl Send for StartProcessJob {}
 impl JobContext for StartProcessJob {
     type OffThread = Self;
     type Js = JSPromiseStrong;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
         this.result = Some(this.connection.start_process(
@@ -718,6 +766,13 @@ impl JobContext for StartProcessJob {
             this.cancel.clone(),
         ));
         Some(done)
+    }
+
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: the connection ref keeps the shared cancellation map alive,
+        // and request_cancel only touches thread-safe state.
+        let job = unsafe { &*off };
+        job.connection.request_cancel(job.operation_id);
     }
 
     fn then(
@@ -752,6 +807,7 @@ unsafe impl Send for ExecJob {}
 impl JobContext for ExecJob {
     type OffThread = Self;
     type Js = JSPromiseStrong;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
         this.result = Some(this.connection.exec(
@@ -762,6 +818,13 @@ impl JobContext for ExecJob {
             this.cancel.clone(),
         ));
         Some(done)
+    }
+
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: the connection ref keeps the shared cancellation map alive,
+        // and request_cancel only touches thread-safe state.
+        let job = unsafe { &*off };
+        job.connection.request_cancel(job.operation_id);
     }
 
     fn then(
@@ -793,13 +856,22 @@ struct ConnectJs {
 impl JobContext for ConnectJob {
     type OffThread = Self;
     type Js = ConnectJs;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
-        this.result = Some(this.connection.connect(&this.config));
+        this.result = Some(this.connection.connect(&this.config, this.cancel.clone()));
         Some(done)
     }
 
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: the connection ref keeps the shared cancellation map alive,
+        // and request_cancel only touches thread-safe state.
+        let job = unsafe { &*off };
+        job.connection.request_cancel(job.operation_id);
+    }
+
     fn then(mut this: Self, mut js: ConnectJs, cx: &bun_jsc::JsThread<'_>) -> JsResult<()> {
+        this.connection.finish_operation(this.operation_id);
         let global = cx.global();
         match this.result.take().expect("connect result") {
             Ok(info) => js
@@ -829,14 +901,23 @@ unsafe impl Send for AuthJob {}
 impl JobContext for AuthJob {
     type OffThread = Self;
     type Js = JSPromiseStrong;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
         let auth = this.auth.take().expect("authentication request");
-        this.result = Some(
-            this.connection
-                .authenticate(&auth, this.timeout_ms, this.cancel.clone()),
-        );
+        this.result = Some(this.connection.authenticate(
+            &auth,
+            this.timeout_ms,
+            this.cancel.clone(),
+        ));
         Some(done)
+    }
+
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: the connection ref keeps the shared cancellation map alive,
+        // and request_cancel only touches thread-safe state.
+        let job = unsafe { &*off };
+        job.connection.request_cancel(job.operation_id);
     }
 
     fn then(
@@ -859,6 +940,8 @@ impl JobContext for AuthJob {
 struct CloseJob {
     connection: bun_ptr::RefPtr<SSHConnection>,
     grace_period_ms: u64,
+    cancel_sender: ExecCancelSender,
+    cancel: ExecCancelReceiver,
     result: Option<Result<CloseResult, CloseError>>,
 }
 
@@ -869,10 +952,21 @@ unsafe impl Send for CloseJob {}
 impl JobContext for CloseJob {
     type OffThread = Self;
     type Js = JSPromiseStrong;
+    const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
-        this.result = Some(this.connection.close_session(this.grace_period_ms));
+        this.result = Some(
+            this.connection
+                .close_session_with_cancel(this.grace_period_ms, this.cancel.clone()),
+        );
         Some(done)
+    }
+
+    unsafe fn cancel(off: *mut Self::OffThread) {
+        // SAFETY: watch::Sender is thread-safe and request_cancel only touches
+        // thread-safe state.
+        let job = unsafe { &*off };
+        job.cancel_sender.send_replace(true);
     }
 
     fn then(

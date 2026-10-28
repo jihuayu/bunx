@@ -38,6 +38,7 @@ pub struct ConnectionInfo {
 
 #[derive(Debug)]
 pub enum ConnectError {
+    Aborted(&'static str),
     Timeout(&'static str),
     HostKey(HostKeyError),
     Protocol(String),
@@ -47,6 +48,7 @@ pub enum ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Aborted(_) => f.write_str("SSH connection was aborted"),
             Self::Timeout("dns") => f.write_str("SSH DNS lookup timed out"),
             Self::Timeout("tcp") => f.write_str("SSH TCP connection timed out"),
             Self::Timeout(_) => f.write_str("SSH handshake timed out"),
@@ -64,6 +66,7 @@ impl std::error::Error for ConnectError {}
 impl ConnectError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Aborted(_) => "ERR_SSH_ABORTED",
             Self::Timeout(_) => "ERR_SSH_CONNECT_TIMEOUT",
             Self::HostKey(error) => error.code(),
             Self::Protocol(_) => "ERR_SSH_PROTOCOL",
@@ -73,7 +76,7 @@ impl ConnectError {
 
     pub fn phase(&self) -> &'static str {
         match self {
-            Self::Timeout(phase) | Self::Io(phase, _) => phase,
+            Self::Aborted(phase) | Self::Timeout(phase) | Self::Io(phase, _) => phase,
             Self::Protocol(_) => "handshake",
             Self::HostKey(_) => "host-key",
         }
@@ -447,6 +450,20 @@ pub struct BlockingSession {
 
 impl BlockingSession {
     pub fn connect_transport(config: &TransportConfig) -> Result<Self, ConnectError> {
+        Self::connect_transport_with_optional_cancel(config, None)
+    }
+
+    pub fn connect_transport_with_cancel(
+        config: &TransportConfig,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_transport_with_optional_cancel(config, Some(cancel))
+    }
+
+    fn connect_transport_with_optional_cancel(
+        config: &TransportConfig,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<Self, ConnectError> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -456,7 +473,7 @@ impl BlockingSession {
                 .map_err(|error| ConnectError::Io("handshake", error.to_string()))?,
         );
         let session =
-            runtime.block_on(connect_transport_with_runtime(config, Arc::clone(&runtime)))?;
+            runtime.block_on(connect_inner(config, Some(Arc::clone(&runtime)), cancel))?;
         Ok(Self {
             runtime,
             session: Arc::new(std::sync::Mutex::new(session)),
@@ -512,12 +529,28 @@ impl BlockingSession {
     }
 
     pub fn close_with_timeout(&self, grace_period: Duration) -> Result<CloseResult, CloseError> {
+        self.close_with_timeout_optional_cancel(grace_period, None)
+    }
+
+    pub fn close_with_timeout_cancel(
+        &self,
+        grace_period: Duration,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CloseResult, CloseError> {
+        self.close_with_timeout_optional_cancel(grace_period, Some(cancel))
+    }
+
+    fn close_with_timeout_optional_cancel(
+        &self,
+        grace_period: Duration,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<CloseResult, CloseError> {
         let session = self
             .session
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.runtime
-            .block_on(session.close_with_timeout(grace_period))
+            .block_on(session.close_with_timeout_optional_cancel(grace_period, cancel))
     }
 
     pub fn exec_with_cancel(
@@ -579,35 +612,65 @@ impl Session {
         &self,
         grace_period: Duration,
     ) -> Result<CloseResult, CloseError> {
+        self.close_with_timeout_optional_cancel(grace_period, None)
+            .await
+    }
+
+    pub async fn close_with_timeout_cancel(
+        &self,
+        grace_period: Duration,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<CloseResult, CloseError> {
+        self.close_with_timeout_optional_cancel(grace_period, Some(cancel))
+            .await
+    }
+
+    async fn close_with_timeout_optional_cancel(
+        &self,
+        grace_period: Duration,
+        mut cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<CloseResult, CloseError> {
         let mut slot = self.inner.handle.lock().await;
         let Some(mut handle) = slot.take() else {
             return Ok(CloseResult { forced: false });
         };
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Ok(CloseResult { forced: true });
+        }
         let started = tokio::time::Instant::now();
 
-        match tokio::time::timeout(
-            grace_period,
-            handle.disconnect(Disconnect::ByApplication, "", ""),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if handle.is_closed() => {
+        let disconnect = tokio::select! {
+            biased;
+            _ = wait_for_optional_cancel(&mut cancel) => None,
+            result = tokio::time::timeout(
+                grace_period,
+                handle.disconnect(Disconnect::ByApplication, "", ""),
+            ) => Some(result),
+        };
+        match disconnect {
+            None => return Ok(CloseResult { forced: true }),
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(error))) if handle.is_closed() => {
                 let _ = error;
                 return Ok(CloseResult { forced: false });
             }
-            Ok(Err(error)) => return Err(CloseError::Protocol(error.to_string())),
-            Err(_) => return Ok(CloseResult { forced: true }),
+            Some(Ok(Err(error))) => return Err(CloseError::Protocol(error.to_string())),
+            Some(Err(_)) => return Ok(CloseResult { forced: true }),
         }
 
         let remaining = grace_period.saturating_sub(started.elapsed());
-        match tokio::time::timeout(remaining, &mut handle).await {
-            Ok(Ok(())) => Ok(CloseResult { forced: false }),
-            Ok(Err(_)) => {
+        let closed = tokio::select! {
+            biased;
+            _ = wait_for_optional_cancel(&mut cancel) => None,
+            result = tokio::time::timeout(remaining, &mut handle) => Some(result),
+        };
+        match closed {
+            Some(Ok(Ok(()))) => Ok(CloseResult { forced: false }),
+            Some(Ok(Err(_))) => {
                 // The transport is gone, which is the postcondition of close.
                 Ok(CloseResult { forced: false })
             }
-            Err(_) => Ok(CloseResult { forced: true }),
+            Some(Err(_)) | None => Ok(CloseResult { forced: true }),
         }
     }
 
@@ -1305,7 +1368,7 @@ pub async fn connect(config: &Config) -> Result<Session, ConnectError> {
 /// Connect and verify the server host key without resolving or sending an
 /// authentication secret.
 pub async fn connect_transport(config: &TransportConfig) -> Result<Session, ConnectError> {
-    connect_inner(config, None).await
+    connect_inner(config, None, None).await
 }
 
 /// Connect with a dedicated Tokio runtime retained by the returned session.
@@ -1323,13 +1386,17 @@ pub async fn connect_transport_with_runtime(
     config: &TransportConfig,
     runtime: Arc<tokio::runtime::Runtime>,
 ) -> Result<Session, ConnectError> {
-    connect_inner(config, Some(runtime)).await
+    connect_inner(config, Some(runtime), None).await
 }
 
 async fn connect_inner(
     config: &TransportConfig,
     runtime: Option<Arc<tokio::runtime::Runtime>>,
+    mut cancel: Option<watch::Receiver<bool>>,
 ) -> Result<Session, ConnectError> {
+    if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+        return Err(ConnectError::Aborted("handshake"));
+    }
     let (sender, receiver) = oneshot::channel();
     let state = Arc::new(Mutex::new(CheckState {
         sender: Some(sender),
@@ -1349,17 +1416,29 @@ async fn connect_inner(
     };
     let client_config = Arc::new(client_config);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(config.connect_timeout_ms);
-    let addresses = tokio::time::timeout_at(
-        deadline,
-        lookup_host((config.hostname.as_str(), config.port)),
-    )
-    .await
+    let addresses = tokio::select! {
+        biased;
+        _ = wait_for_optional_cancel(&mut cancel) => {
+            return Err(ConnectError::Aborted("dns"));
+        }
+        result = tokio::time::timeout_at(
+            deadline,
+            lookup_host((config.hostname.as_str(), config.port)),
+        ) => result,
+    }
     .map_err(|_| ConnectError::Timeout("dns"))?
     .map_err(|error| ConnectError::Io("dns", error.to_string()))?;
     let mut last_tcp_error = None;
     let mut socket = None;
     for address in addresses {
-        match tokio::time::timeout_at(deadline, TcpStream::connect(address)).await {
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_optional_cancel(&mut cancel) => {
+                return Err(ConnectError::Aborted("tcp"));
+            }
+            result = tokio::time::timeout_at(deadline, TcpStream::connect(address)) => result,
+        };
+        match result {
             Ok(Ok(stream)) => {
                 socket = Some(stream);
                 break;
@@ -1378,17 +1457,28 @@ async fn connect_inner(
     })?;
     let _ = socket.set_nodelay(true);
 
-    let handle = tokio::time::timeout_at(
-        deadline,
-        client::connect_stream(client_config, socket, handler),
-    )
-    .await
+    let handle = tokio::select! {
+        biased;
+        _ = wait_for_optional_cancel(&mut cancel) => {
+            return Err(ConnectError::Aborted("handshake"));
+        }
+        result = tokio::time::timeout_at(
+            deadline,
+            client::connect_stream(client_config, socket, handler),
+        ) => result,
+    }
     .map_err(|_| ConnectError::Timeout("handshake"))?
     .map_err(map_connect_error)?;
 
-    let check = receiver.await.map_err(|_| {
-        ConnectError::Protocol("connection closed before host key verification".into())
-    })?;
+    let check = tokio::select! {
+        biased;
+        _ = wait_for_optional_cancel(&mut cancel) => {
+            drop(handle);
+            return Err(ConnectError::Aborted("host-key"));
+        }
+        check = receiver => check,
+    }
+    .map_err(|_| ConnectError::Protocol("connection closed before host key verification".into()))?;
     let info = match check {
         Ok(info) => info,
         Err(error) => {
@@ -1396,6 +1486,10 @@ async fn connect_inner(
             return Err(ConnectError::HostKey(error));
         }
     };
+    if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+        drop(handle);
+        return Err(ConnectError::Aborted("host-key"));
+    }
     Ok(Session {
         inner: Arc::new(SessionInner {
             handle: Mutex::new(Some(handle)),
@@ -1404,6 +1498,17 @@ async fn connect_inner(
             _runtime: runtime,
         }),
     })
+}
+
+async fn wait_for_optional_cancel(cancel: &mut Option<watch::Receiver<bool>>) {
+    let Some(cancel) = cancel.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if *cancel.borrow() {
+        return;
+    }
+    let _ = cancel.changed().await;
 }
 
 impl Session {
@@ -1898,6 +2003,52 @@ mod tests {
 
     fn password_auth() -> Auth {
         Auth::Password(crate::Secret::Text(PASSWORD.to_string()))
+    }
+
+    #[test]
+    fn blocking_connect_can_be_cancelled_during_handshake() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (handshake_started, handshake_waiter) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0u8; 1024];
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count != 0);
+            handshake_started.send(()).unwrap();
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let config = TransportConfig {
+            hostname: "127.0.0.1".into(),
+            port: address.port(),
+            username: USERNAME.into(),
+            host_key: crate::HostKeyPolicy::Pinned(vec!["SHA256:unused".into()]),
+            connect_timeout_ms: 10_000,
+            max_channels: DEFAULT_MAX_CHANNELS,
+        };
+        let (cancel_sender, cancel_receiver) = exec_cancellation();
+        let client = std::thread::spawn(move || {
+            BlockingSession::connect_transport_with_cancel(&config, cancel_receiver)
+        });
+
+        handshake_waiter
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        cancel_sender.send_replace(true);
+        let result = client.join().unwrap();
+        assert!(matches!(result, Err(ConnectError::Aborted("handshake"))));
+        server.join().unwrap();
     }
 
     #[tokio::test]

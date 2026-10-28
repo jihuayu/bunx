@@ -875,6 +875,59 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("worker termination cancels an in-flight SSH connection", async () => {
+    let accepted = () => {};
+    const connected = new Promise<void>(resolve => {
+      accepted = resolve;
+    });
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open() {
+          accepted();
+        },
+        data() {},
+      },
+    });
+    let worker: Worker | undefined;
+    let workerUrl: string | undefined;
+    try {
+      workerUrl = URL.createObjectURL(
+        new Blob(
+          [
+            `
+              const ssh = new Bun.SSH({
+                hostname: "127.0.0.1",
+                port: ${listener.port},
+                username: "worker",
+                hostKey: { type: "pinned", sha256: ["SHA256:unused"] },
+                auth: { type: "password", password: "unused" },
+                connectTimeoutMs: 60_000,
+              });
+              ssh.connect().catch(() => {});
+            `,
+          ],
+          { type: "application/javascript" },
+        ),
+      );
+      worker = new Worker(
+        workerUrl,
+      );
+      await connected;
+
+      const started = performance.now();
+      await worker.terminate();
+      expect(performance.now() - started).toBeLessThan(1_000);
+    } finally {
+      await worker?.terminate();
+      if (workerUrl !== undefined) {
+        URL.revokeObjectURL(workerUrl);
+      }
+      listener.stop(true);
+    }
+  });
+
   test("connect timeout reports the native handshake phase", async () => {
     const listener = Bun.listen({
       hostname: "127.0.0.1",
