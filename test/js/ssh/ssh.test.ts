@@ -475,6 +475,7 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
   let knownHosts: Blob;
   let privateKey: Blob;
   let encryptedPrivateKey: Blob;
+  let hostKeyFingerprint: string;
   let wrongPinsHostKey: Bun.SSHHostKeyPolicy;
 
   function client(overrides: Record<string, unknown> = {}) {
@@ -516,6 +517,19 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     );
     const publicKey = (await Bun.file(`${hostKey}.pub`).text()).trim().split(/\s+/).slice(0, 2).join(" ");
     await Bun.write(join(dir, "known_hosts"), `[127.0.0.1]:${port} ${publicKey}\n`);
+    const fingerprintLine = Bun.spawnSync({
+      cmd: [sshKeygen!, "-l", "-f", `${hostKey}.pub`],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (fingerprintLine.exitCode !== 0) {
+      throw new Error(`ssh-keygen -l failed\n${fingerprintLine.stderr.toString()}`);
+    }
+    hostKeyFingerprint = fingerprintLine.stdout.toString().trim().split(/\s+/)[1];
+    if (!hostKeyFingerprint.startsWith("SHA256:")) {
+      throw new Error(`unexpected host key fingerprint: ${hostKeyFingerprint}`);
+    }
 
     const config = join(dir, "sshd_config");
     await Bun.write(
@@ -617,6 +631,33 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
 
     await ssh.connect();
     expect(passphraseCalls).toBe(1);
+    await ssh.close();
+  });
+
+  test("accepts a matching pin after earlier non-matching pins", async () => {
+    let keyCalls = 0;
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: {
+        type: "pinned",
+        sha256: ["SHA256:not-the-server-key", hostKeyFingerprint],
+      },
+      auth: {
+        type: "privateKey",
+        key: () => {
+          keyCalls++;
+          return privateKey;
+        },
+      },
+      authenticationTimeoutMs: 5_000,
+    });
+
+    await ssh.connect();
+    expect(ssh.state).toBe("ready");
+    expect(ssh.info!.hostKeySHA256).toBe(hostKeyFingerprint);
+    expect(keyCalls).toBe(1);
     await ssh.close();
   });
 
