@@ -2,6 +2,7 @@ name: Bunx release packages
 
 on:
   push:
+    branches: [main]
     tags: ["bunx-v*"]
   workflow_dispatch:
 
@@ -14,7 +15,7 @@ defaults:
 
 concurrency:
   group: bunx-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
