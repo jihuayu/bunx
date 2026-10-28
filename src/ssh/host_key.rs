@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use data_encoding::BASE64_MIME;
 use hmac::{Hmac, KeyInit, Mac};
-use russh::keys::{HashAlg, PublicKey, parse_public_key_base64};
+use russh::keys::{parse_public_key_base64, HashAlg, PublicKey};
 use sha1::Sha1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,7 +131,7 @@ impl KnownHosts {
                     fingerprint,
                 });
             }
-            if marker == Some(b"@cert-authority") {
+            if marker.is_some() {
                 continue;
             }
             if known.algorithm() == key.algorithm() && known.key_data() != key.key_data() {
@@ -378,6 +378,26 @@ mod tests {
             Err(HostKeyError::Revoked {
                 line: 1,
                 fingerprint: fingerprint(&key),
+            })
+        );
+    }
+
+    #[test]
+    fn revoked_entries_do_not_shadow_a_current_key() {
+        let revoked = test_key();
+        let current = test_key();
+        let source = format!(
+            "@revoked localhost {}\nlocalhost {}\n",
+            public_key_fields(&revoked),
+            public_key_fields(&current)
+        );
+        let known = KnownHosts::new(source.into_bytes());
+        assert_eq!(known.verify("localhost", 22, &current), Ok(()));
+        assert_eq!(
+            known.verify("localhost", 22, &revoked),
+            Err(HostKeyError::Revoked {
+                line: 1,
+                fingerprint: fingerprint(&revoked),
             })
         );
     }
