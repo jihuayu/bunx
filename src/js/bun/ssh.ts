@@ -14,12 +14,17 @@ const DEFAULT_MAX_CHANNELS = 8;
 const DEFAULT_MAX_PENDING_OPERATIONS = 64;
 const DEFAULT_QUEUE_TIMEOUT_MS = 30_000;
 const DEFAULT_CLOSE_GRACE_PERIOD_MS = 5_000;
+const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const SHA256_PREFIX = "SHA256:";
 const MAX_KNOWN_HOSTS_BYTES = 1024 * 1024;
 const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
+const MAX_COMMAND_BYTES = 64 * 1024;
+const MAX_EXEC_INPUT_BYTES = 32 * 1024 * 1024;
 const EMPTY_BYTES = new Uint8Array();
 const NativeSSHConnection = $bindgen("ssh_jsc.bind.ts", "SSHConnection");
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 const AUTH_TIMEOUT = Symbol("SSH authentication timeout");
 
 const configObjectKeys = [
@@ -38,15 +43,40 @@ const hostKeyKeys = ["type", "file", "sha256"];
 const authKeys = ["type", "password", "key", "passphrase"];
 const connectKeys = ["signal"];
 const closeKeys = ["force", "gracePeriodMs"];
+const execKeys = ["signal", "timeoutMs", "stdin", "check", "maxOutputBytes"];
 
 class SSHError extends Error {
-  constructor(message: string, options: { code: string; phase: string; cause?: unknown }) {
+  constructor(
+    message: string,
+    options: {
+      code: string;
+      phase: string;
+      cause?: unknown;
+      operationId?: string;
+      remoteExecution?: string;
+      status?: object;
+      stdout?: Uint8Array;
+      stderr?: Uint8Array;
+    },
+  ) {
     super(message);
     this.name = "SSHError";
     defineProperty(this, "code", { value: options.code, enumerable: true });
     defineProperty(this, "phase", { value: options.phase, enumerable: true });
-    defineProperty(this, "operationId", { value: "", enumerable: true });
-    defineProperty(this, "remoteExecution", { value: "not-started", enumerable: true });
+    defineProperty(this, "operationId", { value: options.operationId ?? "", enumerable: true });
+    defineProperty(this, "remoteExecution", {
+      value: options.remoteExecution ?? "not-started",
+      enumerable: true,
+    });
+    if (options.status !== undefined) {
+      defineProperty(this, "status", { value: options.status, enumerable: true });
+    }
+    if (options.stdout !== undefined) {
+      defineProperty(this, "stdout", { value: options.stdout, enumerable: true });
+    }
+    if (options.stderr !== undefined) {
+      defineProperty(this, "stderr", { value: options.stderr, enumerable: true });
+    }
     if (options.cause !== undefined) {
       defineProperty(this, "cause", { value: options.cause, enumerable: false });
     }
@@ -87,7 +117,28 @@ function normalizeError(error: unknown, fallbackCode: string, fallbackPhase: str
         typeof (error as { message?: unknown }).message === "string"
           ? (error as { message: string }).message
           : "Bun.SSH operation failed";
-      return new SSHError(message, { code, phase, cause: error });
+      const native = error as {
+        operationId?: unknown;
+        remoteExecution?: unknown;
+        status?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+      };
+      return new SSHError(message, {
+        code,
+        phase,
+        cause: error,
+        operationId: typeof native.operationId === "string" ? native.operationId : undefined,
+        remoteExecution:
+          native.remoteExecution === "may-have-started" ||
+          native.remoteExecution === "exit-observed" ||
+          native.remoteExecution === "not-started"
+            ? native.remoteExecution
+            : undefined,
+        status: snapshotExitStatus(native.status),
+        stdout: native.stdout instanceof Uint8Array ? copyErrorBytes(native.stdout) : undefined,
+        stderr: native.stderr instanceof Uint8Array ? copyErrorBytes(native.stderr) : undefined,
+      });
     }
   }
 
@@ -96,6 +147,34 @@ function normalizeError(error: unknown, fallbackCode: string, fallbackPhase: str
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return $isObject(value) && !ArrayIsArray(value);
+}
+
+function copyErrorBytes(value: Uint8Array): Uint8Array {
+  try {
+    return new Uint8Array(value);
+  } catch {
+    return EMPTY_BYTES;
+  }
+}
+
+function snapshotExitStatus(value: unknown): object | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  if (value.type === "exit" && NumberIsSafeInteger(value.code) && value.code >= 0 && value.code <= 0xffff_ffff) {
+    return ObjectFreeze({ type: "exit", code: value.code });
+  }
+  if (value.type === "signal" && typeof value.signal === "string" && typeof value.coreDumped === "boolean") {
+    return ObjectFreeze({
+      type: "signal",
+      signal: value.signal,
+      coreDumped: value.coreDumped,
+    });
+  }
+  if (value.type === "unknown") {
+    return ObjectFreeze({ type: "unknown" });
+  }
+  return undefined;
 }
 
 function rejectUnknownKeys(value: Record<string, unknown>, path: string, allowedKeys: string[]) {
@@ -295,6 +374,68 @@ function snapshotCloseOptions(value: unknown) {
   });
 }
 
+function snapshotCommand(value: unknown): Uint8Array {
+  if (typeof value !== "string" || value.length === 0) {
+    configError('SSH option "command" must be a non-empty string');
+  }
+  if (value.indexOf("\0") !== -1) {
+    configError('SSH option "command" must not contain NUL characters');
+  }
+  const bytes = textEncoder.encode(value);
+  if (bytes.byteLength > MAX_COMMAND_BYTES) {
+    throw runtimeError(`SSH command exceeds the ${MAX_COMMAND_BYTES}-byte limit`, "ERR_SSH_RESOURCE_LIMIT", "config");
+  }
+  return bytes;
+}
+
+function snapshotExecOptions(value: unknown) {
+  if (value === undefined) {
+    value = {};
+  }
+  const options = requireRecord(value, "exec options");
+  rejectUnknownKeys(options, "", execKeys);
+
+  const signal = ownValue(options, "", "signal");
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    configError('SSH option "signal" must be an AbortSignal');
+  }
+
+  const timeoutMs = optionalNonNegativeSafeInteger(
+    ownValue(options, "", "timeoutMs"),
+    "timeoutMs",
+    DEFAULT_EXEC_TIMEOUT_MS,
+  );
+  const maxOutputBytes = optionalNonNegativeSafeInteger(
+    ownValue(options, "", "maxOutputBytes"),
+    "maxOutputBytes",
+    DEFAULT_MAX_OUTPUT_BYTES,
+  );
+  const checkValue = ownValue(options, "", "check");
+  if (checkValue !== undefined && typeof checkValue !== "boolean") {
+    configError('SSH option "check" must be a boolean');
+  }
+
+  const stdin = ownValue(options, "", "stdin");
+  if (
+    stdin !== undefined &&
+    typeof stdin !== "string" &&
+    !(stdin instanceof Uint8Array) &&
+    !(stdin instanceof ArrayBuffer) &&
+    !(stdin instanceof Blob) &&
+    !(stdin instanceof ReadableStream)
+  ) {
+    configError('SSH option "stdin" must be a string, Uint8Array, ArrayBuffer, Blob, or ReadableStream');
+  }
+
+  return ObjectFreeze({
+    signal,
+    timeoutMs,
+    maxOutputBytes,
+    check: checkValue === true,
+    stdin,
+  });
+}
+
 function withAbort<T>(promise: PromiseLike<T> | T, signal: AbortSignal, phase: () => string): Promise<T> {
   if (signal.aborted) {
     return Promise.reject(abortError(signal, phase()));
@@ -357,6 +498,132 @@ async function readBlob(
     throw runtimeError(`${path} exceeds the ${maxBytes}-byte limit`, "ERR_SSH_RESOURCE_LIMIT", phase);
   }
   return copyRuntimeBytes(bytes, path, phase);
+}
+
+function checkExecInputSize(size: number): void {
+  if (size > MAX_EXEC_INPUT_BYTES) {
+    throw runtimeError(`SSH stdin exceeds the ${MAX_EXEC_INPUT_BYTES}-byte limit`, "ERR_SSH_RESOURCE_LIMIT", "exec");
+  }
+}
+
+async function readExecInput(input: unknown, signal: AbortSignal): Promise<Uint8Array> {
+  if (input === undefined) {
+    return EMPTY_BYTES;
+  }
+  if (typeof input === "string") {
+    const bytes = textEncoder.encode(input);
+    checkExecInputSize(bytes.byteLength);
+    return bytes;
+  }
+  if (input instanceof Uint8Array) {
+    checkExecInputSize(input.byteLength);
+    return copyRuntimeBytes(input, "SSH stdin", "exec");
+  }
+  if (input instanceof ArrayBuffer) {
+    checkExecInputSize(input.byteLength);
+    return new Uint8Array(input.slice(0));
+  }
+  if (input instanceof Blob) {
+    if (input.size > MAX_EXEC_INPUT_BYTES) {
+      checkExecInputSize(input.size);
+    }
+    return readBlob(input, "SSH stdin", MAX_EXEC_INPUT_BYTES, "exec", signal);
+  }
+
+  const stream = input as ReadableStream<Uint8Array>;
+  if (stream.locked) {
+    throw runtimeError("SSH stdin stream is already locked", "ERR_SSH_IO", "exec");
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) {
+        throw abortError(signal, "exec");
+      }
+      let result;
+      try {
+        result = await withAbort(reader.read(), signal, () => "exec");
+      } catch (cause) {
+        if (cause instanceof SSHError) {
+          throw cause;
+        }
+        throw runtimeError("failed to read SSH stdin stream", "ERR_SSH_IO", "exec", cause);
+      }
+      if (result.done) {
+        break;
+      }
+      const chunk = result.value;
+      if (!(chunk instanceof Uint8Array)) {
+        throw runtimeError("SSH stdin stream must yield Uint8Array chunks", "ERR_SSH_IO", "exec");
+      }
+      const nextTotal = total + chunk.byteLength;
+      if (!NumberIsSafeInteger(nextTotal)) {
+        throw runtimeError(
+          `SSH stdin exceeds the ${MAX_EXEC_INPUT_BYTES}-byte limit`,
+          "ERR_SSH_RESOURCE_LIMIT",
+          "exec",
+        );
+      }
+      checkExecInputSize(nextTotal);
+      chunks.push(copyRuntimeBytes(chunk, "SSH stdin", "exec"));
+      total = nextTotal;
+    }
+  } catch (error) {
+    if (signal.aborted) {
+      reader.cancel(signal.reason).catch(() => {});
+    }
+    throw error;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    output.set(chunks[i], offset);
+    offset += chunks[i].byteLength;
+  }
+  return output;
+}
+
+function createOperation(signal: AbortSignal | undefined, timeoutMs: number, phase: () => string) {
+  const controller = new AbortController();
+  let timer = null;
+
+  function onAbort() {
+    controller.abort(abortError(signal!, phase()));
+  }
+
+  if (signal !== undefined) {
+    if (signal.aborted) {
+      controller.abort(abortError(signal, phase()));
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+  if (timeoutMs !== 0 && !controller.signal.aborted) {
+    timer = setTimeout(
+      () => controller.abort(runtimeError("SSH operation timed out", "ERR_SSH_TIMEOUT", phase())),
+      timeoutMs,
+    );
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (signal !== undefined) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    },
+  };
 }
 
 async function resolvePassword(source: unknown, signal: AbortSignal, phase: () => string): Promise<Uint8Array> {
@@ -427,6 +694,98 @@ async function resolvePassphrase(source: unknown, signal: AbortSignal, phase: ()
   }
 }
 
+function nativeBytes(value: unknown, name: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw runtimeError(`Bun.SSH returned an invalid ${name} buffer`, "ERR_SSH_PROTOCOL", "exec");
+  }
+  return value;
+}
+
+function nativeRemoteExecution(value: unknown): string {
+  return value === "may-have-started" || value === "exit-observed" || value === "not-started" ? value : "not-started";
+}
+
+class SSHResult {
+  #stdout;
+  #stderr;
+
+  constructor(stdout: Uint8Array, stderr: Uint8Array, status: object, durationMs: number, remoteExecution: string) {
+    this.#stdout = stdout;
+    this.#stderr = stderr;
+    defineProperty(this, "stdout", { value: stdout, enumerable: true });
+    defineProperty(this, "stderr", { value: stderr, enumerable: true });
+    defineProperty(this, "status", { value: status, enumerable: true });
+    defineProperty(this, "exitCode", {
+      value: (status as { type: string; code?: number }).type === "exit" ? (status as { code: number }).code : null,
+      enumerable: true,
+    });
+    defineProperty(this, "durationMs", { value: durationMs, enumerable: true });
+    defineProperty(this, "remoteExecution", { value: remoteExecution, enumerable: true });
+    ObjectFreeze(this);
+  }
+
+  text(): string {
+    return textDecoder.decode(this.#stdout);
+  }
+
+  json(): unknown {
+    return JSON.parse(this.text());
+  }
+}
+
+ObjectFreeze(SSHResult.prototype);
+
+function resultFromNative(value: unknown, durationMs: number): SSHResult {
+  if (!isRecord(value)) {
+    throw runtimeError("Bun.SSH returned an invalid exec result", "ERR_SSH_PROTOCOL", "exec");
+  }
+  const status = snapshotExitStatus(value.status);
+  if (status === undefined) {
+    throw runtimeError("Bun.SSH returned an invalid exit status", "ERR_SSH_PROTOCOL", "exec");
+  }
+  return new SSHResult(
+    nativeBytes(value.stdout, "stdout"),
+    nativeBytes(value.stderr, "stderr"),
+    status,
+    durationMs,
+    nativeRemoteExecution(value.remoteExecution),
+  );
+}
+
+function retagOperation(error: SSHError, operationId: string): SSHError {
+  if (error.operationId !== "") {
+    return error;
+  }
+  const source = error as SSHError & {
+    status?: object;
+    stdout?: Uint8Array;
+    stderr?: Uint8Array;
+    cause?: unknown;
+  };
+  return new SSHError(error.message, {
+    code: error.code,
+    phase: error.phase,
+    operationId,
+    remoteExecution: error.remoteExecution,
+    status: source.status,
+    stdout: source.stdout,
+    stderr: source.stderr,
+    cause: source.cause,
+  });
+}
+
+function exitError(code: string, message: string, result: SSHResult, operationId: string): SSHError {
+  return new SSHError(message, {
+    code,
+    phase: "exec",
+    operationId,
+    remoteExecution: result.remoteExecution,
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  });
+}
+
 class SSH {
   #options;
   #native = null;
@@ -440,6 +799,8 @@ class SSH {
   #operationAbort = null;
   #connectWaiters = 0;
   #phase = "handshake";
+  #activeChannels = 0;
+  #queue = [];
 
   constructor(options: unknown) {
     const source = requireRecord(options, "options");
@@ -541,6 +902,256 @@ class SSH {
     const promise = this.#connect(operation);
     this.#connectPromise = promise;
     return this.#waitForConnection(promise, signal);
+  }
+
+  exec(command: string, options?: unknown): Promise<SSHResult> {
+    let commandBytes;
+    let execOptions;
+    try {
+      commandBytes = snapshotCommand(command);
+      execOptions = snapshotExecOptions(options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    const startedAt = performance.now();
+    let phase = "handshake";
+    const operation = createOperation(execOptions.signal, execOptions.timeoutMs, () => phase);
+    return this.#exec(commandBytes, execOptions, operation, startedAt, value => {
+      phase = value;
+    });
+  }
+
+  async #exec(
+    command: Uint8Array,
+    options,
+    operation,
+    startedAt: number,
+    setPhase: (phase: string) => void,
+  ): Promise<SSHResult> {
+    const signal = operation.signal;
+    let release = null;
+    let operationId = "";
+    try {
+      if (signal.aborted) {
+        throw abortError(signal, "exec");
+      }
+      if (this.#state === "idle" || this.#state === "connecting") {
+        await this.connect({ signal });
+      } else if (this.#state !== "ready") {
+        if (this.#state === "failed" || this.#state === "closed" || this.#state === "closing") {
+          throw new SSHError("Bun.SSH is not available for a new operation", {
+            code: "ERR_SSH_CLOSED",
+            phase: "exec",
+            remoteExecution: "not-started",
+          });
+        }
+      }
+
+      if (signal.aborted) {
+        throw abortError(signal, "exec");
+      }
+      if (this.#state !== "ready" || this.#native === null) {
+        throw new SSHError("Bun.SSH is not ready", {
+          code: "ERR_SSH_CLOSED",
+          phase: "exec",
+          remoteExecution: "not-started",
+        });
+      }
+
+      setPhase("queue");
+      release = await this.#acquireChannel(signal, this.#options.queueTimeoutMs);
+      setPhase("exec");
+      if (signal.aborted) {
+        throw abortError(signal, "exec");
+      }
+
+      const stdin = await readExecInput(options.stdin, signal);
+      if (signal.aborted) {
+        throw abortError(signal, "exec");
+      }
+
+      let remainingTimeout = 0;
+      if (options.timeoutMs !== 0) {
+        remainingTimeout = Math.ceil(startedAt + options.timeoutMs - performance.now());
+        if (remainingTimeout <= 0) {
+          throw runtimeError("SSH operation timed out", "ERR_SSH_TIMEOUT", "exec");
+        }
+      }
+
+      const native = this.#native;
+      const nativeOperation = native.execute(command, stdin, remainingTimeout, options.maxOutputBytes);
+      const nativePromise = nativeOperation.promise;
+      operationId = String(nativeOperation.id);
+      const resultPromise = new Promise((resolve, reject) => {
+        function onAbort() {
+          native.cancelOperation(nativeOperation.id);
+          reject(abortError(signal, "exec"));
+        }
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve(nativePromise).then(
+          value => {
+            signal.removeEventListener("abort", onAbort);
+            if (signal.aborted) {
+              reject(abortError(signal, "exec"));
+            } else {
+              resolve(value);
+            }
+          },
+          error => {
+            signal.removeEventListener("abort", onAbort);
+            reject(error);
+          },
+        );
+      });
+
+      let nativeResult;
+      try {
+        nativeResult = await resultPromise;
+      } catch (error) {
+        throw retagOperation(normalizeError(error, "ERR_SSH_IO", "exec"), operationId);
+      }
+      const result = resultFromNative(nativeResult, performance.now() - startedAt);
+
+      if (result.status.type === "unknown") {
+        throw exitError(
+          "ERR_SSH_EXIT_UNKNOWN",
+          "SSH command ended without a trustworthy exit status",
+          result,
+          operationId,
+        );
+      }
+      if (
+        options.check &&
+        (result.status.type === "signal" || (result.status.type === "exit" && result.status.code !== 0))
+      ) {
+        throw exitError("ERR_SSH_EXIT", "SSH command exited unsuccessfully", result, operationId);
+      }
+      return result;
+    } catch (error) {
+      const normalized = normalizeError(error, "ERR_SSH_IO", "exec");
+      throw operationId === "" ? normalized : retagOperation(normalized, operationId);
+    } finally {
+      operation.cleanup();
+      if (release !== null) {
+        release();
+      }
+    }
+  }
+
+  #acquireChannel(signal: AbortSignal, queueTimeoutMs: number): Promise<() => void> {
+    if (signal.aborted) {
+      return Promise.reject(abortError(signal, "queue"));
+    }
+    if (this.#state !== "ready") {
+      return Promise.reject(
+        new SSHError("Bun.SSH is not ready", {
+          code: "ERR_SSH_CLOSED",
+          phase: "queue",
+          remoteExecution: "not-started",
+        }),
+      );
+    }
+    if (this.#activeChannels < this.#options.maxChannels) {
+      this.#activeChannels++;
+      return Promise.resolve(this.#channelRelease());
+    }
+    if (this.#queue.length >= this.#options.maxPendingOperations) {
+      return Promise.reject(
+        new SSHError("Bun.SSH operation queue is full", {
+          code: "ERR_SSH_QUEUE_FULL",
+          phase: "queue",
+          remoteExecution: "not-started",
+        }),
+      );
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        resolve: null,
+        reject,
+        cleanup: null,
+      };
+      let settled = false;
+      const cleanup = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+        signal.removeEventListener("abort", onAbort);
+      };
+      const remove = () => {
+        const index = this.#queue.indexOf(entry);
+        if (index !== -1) {
+          this.#queue.splice(index, 1);
+        }
+      };
+      const fail = (error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        remove();
+        reject(error);
+      };
+      const onAbort = () => {
+        fail(abortError(signal, "queue"));
+      };
+      const timer =
+        queueTimeoutMs === 0
+          ? null
+          : setTimeout(() => {
+              fail(
+                new SSHError("Bun.SSH operation timed out waiting for an SSH channel", {
+                  code: "ERR_SSH_QUEUE_TIMEOUT",
+                  phase: "queue",
+                  remoteExecution: "not-started",
+                }),
+              );
+            }, queueTimeoutMs);
+
+      entry.resolve = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        this.#activeChannels++;
+        resolve(this.#channelRelease());
+      };
+      entry.cleanup = cleanup;
+      signal.addEventListener("abort", onAbort, { once: true });
+      this.#queue.push(entry);
+    });
+  }
+
+  #channelRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.#activeChannels--;
+      if (this.#state === "ready") {
+        const next = this.#queue.shift();
+        if (next !== undefined) {
+          next.resolve();
+        }
+      }
+    };
+  }
+
+  #rejectQueued(error: SSHError) {
+    while (this.#queue.length !== 0) {
+      const entry = this.#queue.shift();
+      entry.cleanup();
+      entry.reject(error);
+    }
   }
 
   #waitForConnection(connection: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
@@ -711,6 +1322,13 @@ class SSH {
     }
 
     this.#state = "closing";
+    this.#rejectQueued(
+      new SSHError("Bun.SSH was closed before the operation started", {
+        code: "ERR_SSH_CLOSED",
+        phase: "queue",
+        remoteExecution: "not-started",
+      }),
+    );
     this.#operationAbort?.abort();
     this.#closePromise = this.#close(closeOptions);
     return this.#closePromise;

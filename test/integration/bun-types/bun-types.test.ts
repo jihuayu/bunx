@@ -1085,14 +1085,20 @@ describe("@types/bun integration test", () => {
           import {
             SSH,
             SSHError,
+            type ExecOptions,
+            type ExitStatus,
+            type RemoteExecution,
             type SSHAuth,
             type SSHCloseOptions,
             type SSHCloseResult,
             type SSHClosed,
             type SSHConnectOptions,
             type SSHHostKeyPolicy,
+            type SSHInput,
             type SSHOptions,
+            type SSHResult,
             type SSHSecret,
+            type OperationOptions,
             type SecretSource,
           } from "bun";
 
@@ -1129,6 +1135,32 @@ describe("@types/bun integration test", () => {
           const connectOptions: SSHConnectOptions = { signal: AbortSignal.timeout(1_000) };
           const closeOptions: SSHCloseOptions = { force: false, gracePeriodMs: 5_000 };
           const connecting: Promise<void> = ssh.connect(connectOptions);
+          const stdin: SSHInput = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("input"));
+              controller.close();
+            },
+          });
+          const operationOptions: OperationOptions = {
+            signal: AbortSignal.timeout(1_000),
+            timeoutMs: 30_000,
+          };
+          const execOptions: ExecOptions = {
+            ...operationOptions,
+            stdin,
+            check: true,
+            maxOutputBytes: 8 * 1024 * 1024,
+          };
+          const execution: Promise<SSHResult> = ssh.exec("uname -a", execOptions);
+
+          declare const result: SSHResult;
+          const status: ExitStatus = result.status;
+          const exitCode: number | null = result.exitCode;
+          const durationMs: number = result.durationMs;
+          const stdout: Uint8Array = result.stdout;
+          const decoded: string = result.text();
+          const parsed: unknown = result.json();
+          const resultRemoteExecution: RemoteExecution = result.remoteExecution;
           const closing: Promise<SSHCloseResult> = ssh.close(closeOptions);
           const disposing: Promise<void> = ssh[Symbol.asyncDispose]();
 
@@ -1159,6 +1191,15 @@ describe("@types/bun integration test", () => {
 
           // @ts-expect-error - unknown connect fields are rejected
           ssh.connect({ timeoutMs: 1 });
+
+          // @ts-expect-error - stdin must be bytes, text, a Blob, or a readable stream
+          ssh.exec("cat", { stdin: 1 });
+
+          // @ts-expect-error - check is a boolean
+          ssh.exec("true", { check: "yes" });
+
+          // @ts-expect-error - unknown exec fields are rejected
+          ssh.exec("true", { cwd: "/tmp" });
         `,
       },
       emptyInterfaces: expectedEmptyInterfacesWhenNoDOM,

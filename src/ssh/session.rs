@@ -1,13 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use russh::client::Msg;
 use russh::client::{self, AuthResult, Handle, Handler};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key};
-use russh::{Disconnect, Error as RusshError};
-use tokio::sync::{Mutex, oneshot};
+use russh::{ChannelMsg, Disconnect, Error as RusshError, Sig};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::config::{Auth, Config, TransportConfig};
 use crate::host_key::{HostKeyError, fingerprint, sign_algorithm_name, verifier};
+
+pub type ExecCancelSender = watch::Sender<bool>;
+pub type ExecCancelReceiver = watch::Receiver<bool>;
+
+pub fn exec_cancellation() -> (ExecCancelSender, ExecCancelReceiver) {
+    watch::channel(false)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
@@ -130,6 +138,129 @@ impl CloseError {
     pub fn phase(&self) -> &'static str {
         "close"
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteExecution {
+    NotStarted,
+    MayHaveStarted,
+    ExitObserved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExitStatus {
+    Exit { code: u32 },
+    Signal { signal: String, core_dumped: bool },
+    Unknown,
+}
+
+#[derive(Debug)]
+pub struct ExecResult {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_status: ExitStatus,
+    pub remote_execution: RemoteExecution,
+}
+
+#[derive(Debug)]
+pub struct ExecError {
+    code: &'static str,
+    phase: &'static str,
+    message: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_status: ExitStatus,
+    pub remote_execution: RemoteExecution,
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExecError {}
+
+impl ExecError {
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn phase(&self) -> &'static str {
+        self.phase
+    }
+
+    pub fn channel_closed(message: String) -> Self {
+        exec_channel_error(message)
+    }
+}
+
+struct PartialExec {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    total_output: u64,
+    exit_status: ExitStatus,
+    remote_execution: RemoteExecution,
+}
+
+impl PartialExec {
+    fn new() -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            total_output: 0,
+            exit_status: ExitStatus::Unknown,
+            remote_execution: RemoteExecution::NotStarted,
+        }
+    }
+
+    fn push(&mut self, stderr: bool, data: &[u8], max_output_bytes: u64) -> bool {
+        let Ok(data_len) = u64::try_from(data.len()) else {
+            return false;
+        };
+        let Some(total) = self.total_output.checked_add(data_len) else {
+            return false;
+        };
+        if total > max_output_bytes {
+            return false;
+        }
+        let target = if stderr {
+            &mut self.stderr
+        } else {
+            &mut self.stdout
+        };
+        target.extend_from_slice(data);
+        self.total_output = total;
+        true
+    }
+
+    fn remote_execution(&self) -> RemoteExecution {
+        if !matches!(self.exit_status, ExitStatus::Unknown) {
+            RemoteExecution::ExitObserved
+        } else if self.remote_execution == RemoteExecution::NotStarted {
+            RemoteExecution::NotStarted
+        } else {
+            RemoteExecution::MayHaveStarted
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExecReply {
+    Accepted,
+    Rejected,
+}
+
+struct ReadTaskResult {
+    output: PartialExec,
+    clean_close: bool,
+    output_limit: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ExecStop {
+    Timeout,
+    Cancelled,
 }
 
 struct CheckState {
@@ -282,6 +413,28 @@ impl BlockingSession {
         self.runtime
             .block_on(session.close_with_timeout(grace_period))
     }
+
+    pub fn exec_with_cancel(
+        &self,
+        command: Vec<u8>,
+        stdin: Vec<u8>,
+        timeout: Option<Duration>,
+        max_output_bytes: u64,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ExecResult, ExecError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        self.runtime.block_on(session.exec_with_cancel(
+            command,
+            stdin,
+            timeout,
+            max_output_bytes,
+            cancel,
+        ))
+    }
 }
 
 impl Session {
@@ -332,6 +485,399 @@ impl Session {
             }
             Err(_) => Ok(CloseResult { forced: true }),
         }
+    }
+
+    pub async fn exec_with_cancel(
+        &self,
+        command: Vec<u8>,
+        stdin: Vec<u8>,
+        timeout: Option<Duration>,
+        max_output_bytes: u64,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<ExecResult, ExecError> {
+        if *cancel.borrow() {
+            return Err(ExecError {
+                code: "ERR_SSH_ABORTED",
+                phase: "exec",
+                message: "SSH execution was aborted".into(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_status: ExitStatus::Unknown,
+                remote_execution: RemoteExecution::NotStarted,
+            });
+        }
+
+        let deadline = timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return Err(ExecError {
+                code: "ERR_SSH_TIMEOUT",
+                phase: "exec",
+                message: "SSH execution timed out".into(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_status: ExitStatus::Unknown,
+                remote_execution: RemoteExecution::NotStarted,
+            });
+        }
+
+        let channel = {
+            let handle = self.inner.handle.lock().await;
+            let handle = handle
+                .as_ref()
+                .ok_or_else(|| exec_channel_error("SSH session is closed"))?;
+            handle
+                .channel_open_session()
+                .await
+                .map_err(|error| exec_channel_error(error.to_string()))?
+        };
+
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|error| ExecError {
+                code: "ERR_SSH_IO",
+                phase: "exec",
+                message: format!("failed to send SSH exec request: {error}"),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_status: ExitStatus::Unknown,
+                remote_execution: RemoteExecution::NotStarted,
+            })?;
+
+        let (mut read_half, write_half) = channel.split();
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let (done_sender, mut done_receiver) = watch::channel(false);
+        let mut reader = tokio::spawn(async move {
+            let output = read_exec_output(&mut read_half, max_output_bytes, reply_sender).await;
+            let _ = done_sender.send(true);
+            output
+        });
+
+        let reply = tokio::select! {
+            reply = reply_receiver => reply,
+            stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                reader.abort();
+                close_exec_channel(&write_half).await;
+                return Err(exec_stop_error(stop, PartialExec::new()));
+            }
+            _ = done_receiver.changed() => {
+                let output = finish_exec_reader(&mut reader).await;
+                close_exec_channel(&write_half).await;
+                return Err(exec_error_from_reader(
+                    "ERR_SSH_PROTOCOL",
+                    "exec",
+                    "SSH exec channel closed before acknowledging the request",
+                    output,
+                ));
+            }
+        };
+
+        match reply {
+            Ok(ExecReply::Accepted) => {}
+            Ok(ExecReply::Rejected) => {
+                reader.abort();
+                close_exec_channel(&write_half).await;
+                return Err(ExecError {
+                    code: "ERR_SSH_EXEC_REJECTED",
+                    phase: "exec",
+                    message: "SSH server rejected the exec request".into(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    exit_status: ExitStatus::Unknown,
+                    remote_execution: RemoteExecution::NotStarted,
+                });
+            }
+            Err(_) => {
+                let output = finish_exec_reader(&mut reader).await;
+                close_exec_channel(&write_half).await;
+                return Err(exec_error_from_reader(
+                    "ERR_SSH_PROTOCOL",
+                    "exec",
+                    "SSH exec request ended without a reply",
+                    output,
+                ));
+            }
+        }
+
+        if !stdin.is_empty() {
+            let write_result = tokio::select! {
+                result = write_half.data_bytes(stdin) => Some(result),
+                stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                    reader.abort();
+                    close_exec_channel(&write_half).await;
+                    return Err(exec_stop_error(stop, PartialExec::new()));
+                }
+                _ = done_receiver.changed() => None,
+            };
+            if let Some(Err(error)) = write_result {
+                reader.abort();
+                let output = finish_exec_reader(&mut reader).await;
+                close_exec_channel(&write_half).await;
+                return Err(exec_error_from_reader(
+                    "ERR_SSH_IO",
+                    "exec",
+                    format!("failed to write SSH stdin: {error}"),
+                    output,
+                ));
+            }
+        }
+
+        if !*done_receiver.borrow() {
+            let eof_result = tokio::select! {
+                result = write_half.eof() => Some(result),
+                stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                    reader.abort();
+                    close_exec_channel(&write_half).await;
+                    return Err(exec_stop_error(stop, PartialExec::new()));
+                }
+                _ = done_receiver.changed() => None,
+            };
+            if let Some(Err(error)) = eof_result {
+                reader.abort();
+                let output = finish_exec_reader(&mut reader).await;
+                close_exec_channel(&write_half).await;
+                return Err(exec_error_from_reader(
+                    "ERR_SSH_IO",
+                    "exec",
+                    format!("failed to close SSH stdin: {error}"),
+                    output,
+                ));
+            }
+        }
+
+        let output = tokio::select! {
+            result = &mut reader => match result {
+                Ok(output) => output,
+                Err(error) => {
+                    close_exec_channel(&write_half).await;
+                    return Err(ExecError {
+                        code: "ERR_SSH_PROTOCOL",
+                        phase: "exec",
+                        message: format!("SSH exec reader failed: {error}"),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        exit_status: ExitStatus::Unknown,
+                        remote_execution: RemoteExecution::MayHaveStarted,
+                    });
+                }
+            },
+            stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                reader.abort();
+                close_exec_channel(&write_half).await;
+                return Err(exec_stop_error(stop, PartialExec::new()));
+            }
+        };
+
+        close_exec_channel(&write_half).await;
+
+        if output.output_limit {
+            return Err(exec_error_from_reader(
+                "ERR_SSH_OUTPUT_LIMIT",
+                "exec",
+                format!("SSH command output exceeded the {max_output_bytes}-byte limit"),
+                output,
+            ));
+        }
+        if !output.clean_close {
+            return Err(exec_error_from_reader(
+                "ERR_SSH_CONNECTION_LOST",
+                "io",
+                "SSH connection was lost before the exec channel closed cleanly",
+                output,
+            ));
+        }
+
+        let remote_execution = output.output.remote_execution();
+        Ok(ExecResult {
+            stdout: output.output.stdout,
+            stderr: output.output.stderr,
+            exit_status: output.output.exit_status,
+            remote_execution,
+        })
+    }
+}
+
+async fn read_exec_output(
+    read_half: &mut russh::ChannelReadHalf,
+    max_output_bytes: u64,
+    reply: oneshot::Sender<ExecReply>,
+) -> ReadTaskResult {
+    let mut output = PartialExec::new();
+    let mut reply = Some(reply);
+    let mut clean_close = false;
+    let mut output_limit = false;
+
+    while let Some(message) = read_half.wait().await {
+        match message {
+            ChannelMsg::Success => {
+                output.remote_execution = RemoteExecution::MayHaveStarted;
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(ExecReply::Accepted);
+                }
+            }
+            ChannelMsg::Failure => {
+                output.remote_execution = RemoteExecution::NotStarted;
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(ExecReply::Rejected);
+                }
+            }
+            ChannelMsg::Data { data } => {
+                output.remote_execution = RemoteExecution::MayHaveStarted;
+                if !output.push(false, &data, max_output_bytes) {
+                    output_limit = true;
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(ExecReply::Accepted);
+                    }
+                    break;
+                }
+            }
+            ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                output.remote_execution = RemoteExecution::MayHaveStarted;
+                if !output.push(true, &data, max_output_bytes) {
+                    output_limit = true;
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(ExecReply::Accepted);
+                    }
+                    break;
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                if matches!(output.exit_status, ExitStatus::Unknown) {
+                    output.exit_status = ExitStatus::Exit { code: exit_status };
+                }
+            }
+            ChannelMsg::ExitSignal {
+                signal_name,
+                core_dumped,
+                ..
+            } => {
+                if matches!(output.exit_status, ExitStatus::Unknown) {
+                    output.exit_status = ExitStatus::Signal {
+                        signal: signal_name_name(&signal_name),
+                        core_dumped,
+                    };
+                }
+            }
+            ChannelMsg::Close => {
+                clean_close = true;
+                break;
+            }
+            ChannelMsg::Eof | ChannelMsg::WindowAdjusted { .. } => {}
+            _ => {}
+        }
+    }
+
+    ReadTaskResult {
+        output,
+        clean_close,
+        output_limit,
+    }
+}
+
+async fn wait_for_exec_stop(
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
+) -> ExecStop {
+    tokio::select! {
+        result = cancel.changed() => {
+            let _ = result;
+            ExecStop::Cancelled
+        }
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => ExecStop::Timeout,
+    }
+}
+
+async fn finish_exec_reader(
+    reader: &mut tokio::task::JoinHandle<ReadTaskResult>,
+) -> ReadTaskResult {
+    match tokio::time::timeout(Duration::from_millis(500), reader).await {
+        Ok(Ok(output)) => output,
+        _ => ReadTaskResult {
+            output: PartialExec::new(),
+            clean_close: false,
+            output_limit: false,
+        },
+    }
+}
+
+async fn close_exec_channel(write_half: &russh::ChannelWriteHalf<Msg>) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), write_half.close()).await;
+}
+
+fn exec_channel_error(message: impl Into<String>) -> ExecError {
+    ExecError {
+        code: "ERR_SSH_CHANNEL_OPEN",
+        phase: "channel",
+        message: message.into(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        exit_status: ExitStatus::Unknown,
+        remote_execution: RemoteExecution::NotStarted,
+    }
+}
+
+fn exec_stop_error(stop: ExecStop, output: PartialExec) -> ExecError {
+    let (code, phase, message) = match stop {
+        ExecStop::Timeout => (
+            "ERR_SSH_TIMEOUT",
+            "exec",
+            "SSH execution timed out".to_string(),
+        ),
+        ExecStop::Cancelled => (
+            "ERR_SSH_ABORTED",
+            "exec",
+            "SSH execution was aborted".to_string(),
+        ),
+    };
+    exec_error_from_reader(
+        code,
+        phase,
+        message,
+        ReadTaskResult {
+            output,
+            clean_close: false,
+            output_limit: false,
+        },
+    )
+}
+
+fn exec_error_from_reader(
+    code: &'static str,
+    phase: &'static str,
+    message: impl Into<String>,
+    result: ReadTaskResult,
+) -> ExecError {
+    ExecError {
+        code,
+        phase,
+        message: message.into(),
+        remote_execution: result.output.remote_execution(),
+        stdout: result.output.stdout,
+        stderr: result.output.stderr,
+        exit_status: result.output.exit_status,
+    }
+}
+
+fn signal_name_name(signal: &Sig) -> String {
+    match signal {
+        Sig::ABRT => "ABRT".into(),
+        Sig::ALRM => "ALRM".into(),
+        Sig::FPE => "FPE".into(),
+        Sig::HUP => "HUP".into(),
+        Sig::ILL => "ILL".into(),
+        Sig::INT => "INT".into(),
+        Sig::KILL => "KILL".into(),
+        Sig::PIPE => "PIPE".into(),
+        Sig::QUIT => "QUIT".into(),
+        Sig::SEGV => "SEGV".into(),
+        Sig::TERM => "TERM".into(),
+        Sig::USR1 => "USR1".into(),
+        Sig::Custom(name) => name.clone(),
     }
 }
 

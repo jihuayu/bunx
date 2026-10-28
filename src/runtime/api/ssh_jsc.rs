@@ -2,9 +2,11 @@ use bun_jsc::bindgen::{self, JsHeap, JsScope};
 use bun_jsc::{JSGlobalObject, JSPromiseStrong, JSValue, Job, JobContext, JsAffine, JsResult};
 use bun_ssh::{
     Auth, AuthError, BlockingSession, CloseError, CloseResult, ConnectError, ConnectionInfo,
-    HostKeyPolicy, Secret, TransportConfig,
+    ExecCancelReceiver, ExecCancelSender, ExecError, ExecResult, ExitStatus, HostKeyPolicy,
+    RemoteExecution, Secret, TransportConfig, exec_cancellation,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(bun_ptr::ThreadSafeRefCounted)]
 pub(crate) struct SSHConnection {
@@ -13,11 +15,14 @@ pub(crate) struct SSHConnection {
     config: TransportConfig,
     session: std::sync::Mutex<Option<BlockingSession>>,
     close_requested: AtomicBool,
+    next_operation_id: AtomicU64,
+    operations: std::sync::Mutex<HashMap<u64, ExecCancelSender>>,
     ref_count: bun_ptr::ThreadSafeRefCount<SSHConnection>,
 }
 
 impl Drop for SSHConnection {
     fn drop(&mut self) {
+        self.cancel_all_operations();
         let Some(session) = self
             .session
             .get_mut()
@@ -76,6 +81,8 @@ impl SSHConnection {
             },
             session: std::sync::Mutex::new(None),
             close_requested: AtomicBool::new(false),
+            next_operation_id: AtomicU64::new(0),
+            operations: std::sync::Mutex::new(HashMap::new()),
             ref_count: bun_ptr::ThreadSafeRefCount::init(),
         })))
     }
@@ -155,6 +162,7 @@ impl SSHConnection {
 
     fn close_session(&self, grace_period_ms: u64) -> Result<CloseResult, CloseError> {
         self.close_requested.store(true, Ordering::Release);
+        self.cancel_all_operations();
         let mut slot = self
             .session
             .lock()
@@ -163,6 +171,112 @@ impl SSHConnection {
             return Ok(CloseResult { forced: false });
         };
         session.close_with_timeout(std::time::Duration::from_millis(grace_period_ms))
+    }
+
+    fn begin_operation(&self) -> (u64, ExecCancelReceiver) {
+        let id = self.next_operation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (sender, receiver) = exec_cancellation();
+        self.operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, sender);
+        (id, receiver)
+    }
+
+    fn finish_operation(&self, id: u64) {
+        self.operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+    }
+
+    fn request_cancel(&self, id: u64) -> bool {
+        let operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(sender) = operations.get(&id) else {
+            return false;
+        };
+        sender.send_replace(true);
+        true
+    }
+
+    fn cancel_all_operations(&self) {
+        for sender in self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            sender.send_replace(true);
+        }
+    }
+
+    fn exec(
+        &self,
+        command: Vec<u8>,
+        stdin: Vec<u8>,
+        timeout_ms: u64,
+        max_output_bytes: u64,
+        cancel: ExecCancelReceiver,
+    ) -> Result<ExecResult, ExecError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ExecError::channel_closed("SSH session is not connected".to_string()))?;
+        session.exec_with_cancel(
+            command,
+            stdin,
+            (timeout_ms != 0).then(|| std::time::Duration::from_millis(timeout_ms)),
+            max_output_bytes,
+            cancel,
+        )
+    }
+
+    pub(crate) fn execute<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        command: Vec<u8>,
+        stdin: Vec<u8>,
+        timeout_ms: u64,
+        max_output_bytes: u64,
+    ) -> bindgen::Result<'a, JSValue> {
+        let (operation_id, cancel) = self.begin_operation();
+        let promise = JSPromiseStrong::init(cx.global());
+        let value = promise.value();
+        Job::<ExecJob>::schedule(
+            &cx.js_thread(),
+            ExecJob {
+                connection: unsafe {
+                    bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut())
+                },
+                operation_id,
+                command,
+                stdin,
+                timeout_ms,
+                max_output_bytes,
+                cancel,
+                result: None,
+            },
+            promise,
+        );
+
+        let object = JSValue::create_empty_object(cx.global(), 2);
+        object.put(
+            cx.global(),
+            b"id",
+            JSValue::js_number_from_uint64(operation_id),
+        );
+        object.put(cx.global(), b"promise", value);
+        Ok(object)
+    }
+
+    pub(crate) fn cancel_operation(&self, _cx: &mut JsScope<'_>, operation_id: u64) -> bool {
+        self.request_cancel(operation_id)
     }
 
     pub(crate) fn authenticate_password<'a>(
@@ -256,6 +370,53 @@ struct ConnectJob {
     connection: bun_ptr::RefPtr<SSHConnection>,
     config: TransportConfig,
     result: Option<Result<ConnectionInfo, ConnectError>>,
+}
+
+struct ExecJob {
+    connection: bun_ptr::RefPtr<SSHConnection>,
+    operation_id: u64,
+    command: Vec<u8>,
+    stdin: Vec<u8>,
+    timeout_ms: u64,
+    max_output_bytes: u64,
+    cancel: ExecCancelReceiver,
+    result: Option<Result<ExecResult, ExecError>>,
+}
+
+// SAFETY: every field is owned or thread-safe. The ref keeps the connection
+// payload alive while the channel operation runs.
+unsafe impl Send for ExecJob {}
+
+impl JobContext for ExecJob {
+    type OffThread = Self;
+    type Js = JSPromiseStrong;
+
+    fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
+        this.result = Some(this.connection.exec(
+            std::mem::take(&mut this.command),
+            std::mem::take(&mut this.stdin),
+            this.timeout_ms,
+            this.max_output_bytes,
+            this.cancel.clone(),
+        ));
+        Some(done)
+    }
+
+    fn then(
+        mut this: Self,
+        mut promise: JSPromiseStrong,
+        cx: &bun_jsc::JsThread<'_>,
+    ) -> JsResult<()> {
+        this.connection.finish_operation(this.operation_id);
+        let global = cx.global();
+        match this.result.take().expect("exec result") {
+            Ok(result) => promise.resolve(global, exec_result_to_js(global, result)?),
+            Err(error) => {
+                let error = exec_error_to_js(global, error)?;
+                promise.reject_with_async_stack(global, Ok(error))
+            }
+        }
+    }
 }
 
 // SAFETY: every field is owned or thread-safe. The ref keeps the connection
@@ -410,6 +571,127 @@ fn connection_info_to_js(global: &JSGlobalObject, info: &ConnectionInfo) -> JsRe
         )?,
     );
     Ok(object)
+}
+
+fn exec_result_to_js(global: &JSGlobalObject, result: ExecResult) -> JsResult<JSValue> {
+    let object = JSValue::create_empty_object(global, 5);
+    object.put(
+        global,
+        b"stdout",
+        JSValue::create_buffer_from_box(global, result.stdout.into_boxed_slice())?,
+    );
+    object.put(
+        global,
+        b"stderr",
+        JSValue::create_buffer_from_box(global, result.stderr.into_boxed_slice())?,
+    );
+    object.put(
+        global,
+        b"status",
+        exit_status_to_js(global, &result.exit_status)?,
+    );
+    object.put(
+        global,
+        b"exitCode",
+        exit_status_code_to_js(&result.exit_status),
+    );
+    object.put(
+        global,
+        b"remoteExecution",
+        remote_execution_to_js(global, result.remote_execution)?,
+    );
+    Ok(object)
+}
+
+fn exec_error_to_js(global: &JSGlobalObject, error: ExecError) -> JsResult<JSValue> {
+    let value = native_error(global, error.to_string(), error.code(), error.phase())?;
+    value.put(
+        global,
+        b"status",
+        exit_status_to_js(global, &error.exit_status)?,
+    );
+    value.put(
+        global,
+        b"exitCode",
+        exit_status_code_to_js(&error.exit_status),
+    );
+    value.put(
+        global,
+        b"stdout",
+        JSValue::create_buffer_from_box(global, error.stdout.into_boxed_slice())?,
+    );
+    value.put(
+        global,
+        b"stderr",
+        JSValue::create_buffer_from_box(global, error.stderr.into_boxed_slice())?,
+    );
+    value.put(
+        global,
+        b"remoteExecution",
+        remote_execution_to_js(global, error.remote_execution)?,
+    );
+    Ok(value)
+}
+
+fn exit_status_to_js(global: &JSGlobalObject, status: &ExitStatus) -> JsResult<JSValue> {
+    let object = JSValue::create_empty_object(global, 4);
+    match status {
+        ExitStatus::Exit { code } => {
+            object.put(
+                global,
+                b"type",
+                bun_jsc::bun_string_jsc::create_utf8_for_js(global, b"exit")?,
+            );
+            object.put(
+                global,
+                b"code",
+                JSValue::js_number_from_uint64(u64::from(*code)),
+            );
+        }
+        ExitStatus::Signal {
+            signal,
+            core_dumped,
+        } => {
+            object.put(
+                global,
+                b"type",
+                bun_jsc::bun_string_jsc::create_utf8_for_js(global, b"signal")?,
+            );
+            object.put(
+                global,
+                b"signal",
+                bun_jsc::bun_string_jsc::create_utf8_for_js(global, signal.as_bytes())?,
+            );
+            object.put(global, b"coreDumped", JSValue::js_boolean(*core_dumped));
+        }
+        ExitStatus::Unknown => {
+            object.put(
+                global,
+                b"type",
+                bun_jsc::bun_string_jsc::create_utf8_for_js(global, b"unknown")?,
+            );
+        }
+    }
+    Ok(object)
+}
+
+fn exit_status_code_to_js(status: &ExitStatus) -> JSValue {
+    match status {
+        ExitStatus::Exit { code } => JSValue::js_number_from_uint64(u64::from(*code)),
+        ExitStatus::Signal { .. } | ExitStatus::Unknown => JSValue::NULL,
+    }
+}
+
+fn remote_execution_to_js(
+    global: &JSGlobalObject,
+    remote_execution: RemoteExecution,
+) -> JsResult<JSValue> {
+    let value = match remote_execution {
+        RemoteExecution::NotStarted => b"not-started".as_slice(),
+        RemoteExecution::MayHaveStarted => b"may-have-started".as_slice(),
+        RemoteExecution::ExitObserved => b"exit-observed".as_slice(),
+    };
+    bun_jsc::bun_string_jsc::create_utf8_for_js(global, value)
 }
 
 fn native_error(

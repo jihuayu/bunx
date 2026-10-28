@@ -20,6 +20,14 @@ declare module "bun" {
   type RemoteExecution = "not-started" | "may-have-started" | "exit-observed";
 
   /**
+   * The terminal status reported for a remote command.
+   *
+   * `unknown` means the server did not provide a trustworthy exit status.
+   */
+  type ExitStatus =
+    { type: "exit"; code: number } | { type: "signal"; signal: string; coreDumped: boolean } | { type: "unknown" };
+
+  /**
    * A password or passphrase accepted by Bun.SSH.
    */
   type SSHSecret = string | Uint8Array<ArrayBufferLike>;
@@ -72,6 +80,73 @@ declare module "bun" {
         /** One or more pinned SHA-256 fingerprints. */
         sha256: readonly [string, ...string[]];
       };
+
+  /**
+   * Data accepted as standard input for an SSH command.
+   */
+  type SSHInput = string | Uint8Array<ArrayBufferLike> | ArrayBuffer | Blob | ReadableStream<Uint8Array>;
+
+  /**
+   * Options shared by SSH operations.
+   */
+  interface OperationOptions {
+    /** Cancels this operation without closing the SSH connection. */
+    signal?: AbortSignal | undefined;
+
+    /**
+     * The operation deadline in milliseconds. `0` disables only this
+     * operation's deadline.
+     */
+    timeoutMs?: number | undefined;
+  }
+
+  /**
+   * Options for {@link SSH.exec}.
+   */
+  interface ExecOptions extends OperationOptions {
+    /**
+     * Standard input. When omitted, Bun sends EOF immediately.
+     */
+    stdin?: SSHInput | undefined;
+
+    /**
+     * Reject non-zero exits and signal exits with `ERR_SSH_EXIT`.
+     *
+     * @default false
+     */
+    check?: boolean | undefined;
+
+    /**
+     * Maximum combined stdout and stderr bytes to retain.
+     *
+     * @default 8 * 1024 * 1024
+     */
+    maxOutputBytes?: number | undefined;
+  }
+
+  /**
+   * The fully buffered result of {@link SSH.exec}.
+   */
+  interface SSHResult {
+    readonly stdout: Uint8Array<ArrayBufferLike>;
+    readonly stderr: Uint8Array<ArrayBufferLike>;
+    readonly status: ExitStatus;
+
+    /** The exit code, or `null` when the status is a signal or unknown. */
+    readonly exitCode: number | null;
+
+    /** Monotonic wall-clock duration of the complete operation. */
+    readonly durationMs: number;
+
+    /** Whether the remote command was observed to finish. */
+    readonly remoteExecution: RemoteExecution;
+
+    /** Decode stdout as UTF-8 with replacement for malformed sequences. */
+    text(): string;
+
+    /** Parse {@link text} as JSON. */
+    json(): unknown;
+  }
 
   /**
    * Options for a Bun.SSH client.
@@ -240,6 +315,15 @@ declare module "bun" {
 
     /** Whether the remote command may have started. */
     readonly remoteExecution: RemoteExecution;
+
+    /** The exit status observed when an exec error carries one. */
+    readonly status?: ExitStatus | undefined;
+
+    /** Bounded stdout captured before an exec error. */
+    readonly stdout?: Uint8Array<ArrayBufferLike> | undefined;
+
+    /** Bounded stderr captured before an exec error. */
+    readonly stderr?: Uint8Array<ArrayBufferLike> | undefined;
   }
 
   /**
@@ -273,6 +357,15 @@ declare module "bun" {
      * terminal failure.
      */
     connect(options?: SSHConnectOptions): Promise<void>;
+
+    /**
+     * Execute one raw command in a dedicated SSH channel.
+     *
+     * Calling this method while the client is idle connects and authenticates
+     * first. Concurrent commands share the connection and are admitted by the
+     * configured FIFO channel queue.
+     */
+    exec(command: string, options?: ExecOptions): Promise<SSHResult>;
 
     /**
      * Close the SSH connection.

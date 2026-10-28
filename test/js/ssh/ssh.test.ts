@@ -310,6 +310,31 @@ describe("Bun.SSH constructor", () => {
     });
     expect(ssh.state).toBe("idle");
   });
+
+  test("validates exec arguments without doing I/O", async () => {
+    const ssh = new SSH(validOptions());
+    await expect(ssh.exec("")).rejects.toMatchObject({ code: "ERR_SSH_CONFIG", phase: "config" });
+    await expect(ssh.exec("echo\0hidden")).rejects.toMatchObject({ code: "ERR_SSH_CONFIG", phase: "config" });
+    await expect(ssh.exec("true", { unknown: true })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.exec("true", { timeoutMs: -1 })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.exec("true", { stdin: 42 })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(ssh.exec("true", { signal: controller.signal })).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+    });
+    expect(ssh.state).toBe("idle");
+  });
 });
 
 const sshd =
@@ -379,6 +404,23 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
   let privateKey: Blob;
   let encryptedPrivateKey: Blob;
   let wrongPinsHostKey: Bun.SSHHostKeyPolicy;
+
+  function client(overrides: Record<string, unknown> = {}) {
+    return new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "privateKey", key: privateKey },
+      ...overrides,
+    });
+  }
+
+  async function connectedClient(overrides: Record<string, unknown> = {}) {
+    const ssh = client(overrides);
+    await ssh.connect();
+    return ssh;
+  }
 
   beforeAll(async () => {
     dir = tempDir("bun-ssh-connection", {});
@@ -661,6 +703,106 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
       expect(await ssh.closed).toEqual({ reason: "local", forced: false });
     } finally {
       listener.stop(true);
+    }
+  });
+
+  test("exec captures stdout and stderr and reports an explicit non-zero exit", async () => {
+    const ssh = await connectedClient();
+    try {
+      const result = await ssh.exec("printf 'stdout'; printf 'stderr' >&2; exit 7");
+      expect(result.stdout).toEqual(new TextEncoder().encode("stdout"));
+      expect(result.stderr).toEqual(new TextEncoder().encode("stderr"));
+      expect(result.status).toEqual({ type: "exit", code: 7 });
+      expect(result.exitCode).toBe(7);
+      expect(result.remoteExecution).toBe("exit-observed");
+      expect(result.durationMs).toBeGreaterThanOrEqual(0);
+      expect(result.text()).toBe("stdout");
+      expect(result.text()).toBe("stdout");
+
+      const error = await ssh
+        .exec("printf 'partial'; printf 'warning' >&2; exit 9", { check: true })
+        .catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_EXIT",
+        phase: "exec",
+        status: { type: "exit", code: 9 },
+        remoteExecution: "exit-observed",
+      });
+      expect(new TextDecoder().decode(error.stdout)).toBe("partial");
+      expect(new TextDecoder().decode(error.stderr)).toBe("warning");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec sends binary stdin and resolves JSON without replaying the command", async () => {
+    const ssh = await connectedClient();
+    try {
+      const input = new Uint8Array([0, 1, 2, 127, 128, 255]);
+      const result = await ssh.exec("cat", { stdin: input });
+      expect(result.stdout).toEqual(input);
+
+      const json = await ssh.exec("printf '{\"ok\":true}'");
+      expect(json.json()).toEqual({ ok: true });
+      expect(json.json()).toEqual({ ok: true });
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec admits output exactly at the byte budget and rejects the next byte", async () => {
+    const ssh = await connectedClient();
+    try {
+      const exact = await ssh.exec("printf '12345'", { maxOutputBytes: 5 });
+      expect(exact.text()).toBe("12345");
+
+      const error = await ssh.exec("printf '123456'", { maxOutputBytes: 5 }).catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_OUTPUT_LIMIT",
+        phase: "exec",
+      });
+      expect(error.stdout.byteLength + error.stderr.byteLength).toBeLessThanOrEqual(5);
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec cancellation bounds one channel without poisoning the connection", async () => {
+    const ssh = await connectedClient();
+    try {
+      const controller = new AbortController();
+      const pending = ssh.exec("sleep 5", { signal: controller.signal, timeoutMs: 0 }).catch(error => error);
+      setTimeout(() => controller.abort(), 100);
+      const error = await pending;
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_ABORTED",
+        phase: "exec",
+      });
+
+      const result = await ssh.exec("printf 'still-ready'");
+      expect(result.text()).toBe("still-ready");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec timeout is distinguishable from caller cancellation", async () => {
+    const ssh = await connectedClient();
+    try {
+      const error = await ssh.exec("sleep 5", { timeoutMs: 100 }).catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error).toMatchObject({
+        code: "ERR_SSH_TIMEOUT",
+        phase: "exec",
+      });
+
+      const result = await ssh.exec("printf 'after-timeout'");
+      expect(result.text()).toBe("after-timeout");
+    } finally {
+      await ssh.close();
     }
   });
 });

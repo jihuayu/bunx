@@ -68,5 +68,24 @@ export const SSHConnection = b.class({
       capability: "js",
       throws: true,
     },
+    execute: {
+      args: {
+        command: b.bytes({ from: ["buffer"], held: "copied" }),
+        stdin: b.bytes({ from: ["buffer"], held: "copied" }),
+        timeoutMs: b.u64,
+        maxOutputBytes: b.u64,
+      },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    cancelOperation: {
+      args: {
+        operationId: b.u64,
+      },
+      returns: b.bool,
+      capability: "js",
+      throws: false,
+    },
   },
 });
