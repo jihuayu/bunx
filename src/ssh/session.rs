@@ -241,6 +241,13 @@ impl PartialExec {
         }
     }
 
+    fn sent() -> Self {
+        Self {
+            remote_execution: RemoteExecution::MayHaveStarted,
+            ..Self::new()
+        }
+    }
+
     fn push(&mut self, stderr: bool, data: &[u8], max_output_bytes: u64) -> bool {
         let Ok(data_len) = u64::try_from(data.len()) else {
             return false;
@@ -597,7 +604,7 @@ impl Session {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 exit_status: ExitStatus::Unknown,
-                remote_execution: RemoteExecution::NotStarted,
+                remote_execution: RemoteExecution::MayHaveStarted,
             })?;
 
         let (mut read_half, write_half) = channel.split();
@@ -615,7 +622,7 @@ impl Session {
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 reader.abort();
                 close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::new()));
+                return Err(exec_stop_error(stop, PartialExec::sent()));
             }
             _ = done_receiver.changed() => {
                 let output = finish_exec_reader(&mut reader).await;
@@ -662,7 +669,7 @@ impl Session {
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
                     reader.abort();
                     close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::new()));
+                    return Err(exec_stop_error(stop, PartialExec::sent()));
                 }
                 _ = done_receiver.changed() => None,
             };
@@ -685,7 +692,7 @@ impl Session {
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
                     reader.abort();
                     close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::new()));
+                    return Err(exec_stop_error(stop, PartialExec::sent()));
                 }
                 _ = done_receiver.changed() => None,
             };
@@ -721,7 +728,7 @@ impl Session {
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 reader.abort();
                 close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::new()));
+                return Err(exec_stop_error(stop, PartialExec::sent()));
             }
         };
 
@@ -808,13 +815,13 @@ impl Session {
                         "ERR_SSH_IO",
                         "exec",
                         format!("failed to send SSH exec request: {error}"),
-                        RemoteExecution::NotStarted,
+                        RemoteExecution::MayHaveStarted,
                     ));
                 }
             }
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 let _ = channel.close().await;
-                return Err(exec_stop_error(stop, PartialExec::new()));
+                return Err(exec_stop_error(stop, PartialExec::sent()));
             }
         }
 
@@ -894,7 +901,7 @@ async fn read_exec_output(
     max_output_bytes: u64,
     reply: oneshot::Sender<ExecReply>,
 ) -> ReadTaskResult {
-    let mut output = PartialExec::new();
+    let mut output = PartialExec::sent();
     let mut reply = Some(reply);
     let mut clean_close = false;
     let mut output_limit = false;
@@ -996,7 +1003,7 @@ async fn finish_exec_reader(
     match tokio::time::timeout(Duration::from_millis(500), reader).await {
         Ok(Ok(output)) => output,
         _ => ReadTaskResult {
-            output: PartialExec::new(),
+            output: PartialExec::sent(),
             clean_close: false,
             output_limit: false,
         },
@@ -1398,6 +1405,9 @@ mod tests {
                     session.data(channel, "partial")?;
                     session.disconnect(Disconnect::ByApplication, "", "")?;
                 }
+                b"lost-before-ack" => {
+                    session.disconnect(Disconnect::ByApplication, "", "")?;
+                }
                 b"signal-status" => {
                     session.exit_signal_request(channel, Sig::TERM, true, "", "")?;
                     session.eof(channel)?;
@@ -1754,6 +1764,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "ERR_SSH_ABORTED");
         assert_eq!(error.phase(), "exec");
+        assert_eq!(error.remote_execution, RemoteExecution::NotStarted);
 
         gate.release.notify_one();
         let (_cancel_sender, cancel) = exec_cancellation();
@@ -1764,6 +1775,29 @@ mod tests {
         assert_eq!(result.stdout, b"ok");
         assert_eq!(result.exit_status, ExitStatus::Exit { code: 0 });
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_connection_loss_before_ack_is_may_have_started() {
+        let server = start_server().await;
+        let session = connect(&config(&server, known_hosts(&server), password_auth()))
+            .await
+            .unwrap();
+        session
+            .authenticate(&config(&server, known_hosts(&server), password_auth()))
+            .await
+            .unwrap();
+        let (_cancel_sender, cancel) = exec_cancellation();
+
+        let error = session
+            .exec_with_cancel(b"lost-before-ack".to_vec(), Vec::new(), None, 1024, cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.code(),
+            "ERR_SSH_PROTOCOL" | "ERR_SSH_CONNECTION_LOST"
+        ));
+        assert_eq!(error.remote_execution, RemoteExecution::MayHaveStarted);
     }
 
     #[test]
