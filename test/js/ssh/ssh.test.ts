@@ -860,6 +860,36 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("force close aborts an operation blocked reading stdin", async () => {
+    const ssh = await connectedClient();
+    let notifyPull = () => {};
+    const pullStarted = new Promise<void>(resolve => {
+      notifyPull = resolve;
+    });
+    const input = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          notifyPull();
+          return new Promise(() => {});
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    const executing = ssh.exec("cat", { stdin: input, timeoutMs: 0 }).catch(error => error);
+    await pullStarted;
+    const closing = ssh.close({ force: true });
+    const [error, result] = await Promise.all([executing, closing]);
+
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_ABORTED",
+      phase: "exec",
+    });
+    expect(result).toEqual({ forced: true });
+    expect(ssh.state).toBe("closed");
+  });
+
   test("reports a refused TCP connection in the tcp phase", async () => {
     const port = reservePort();
     const ssh = new SSH({
@@ -1246,7 +1276,7 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     async () => {
       const ssh = await connectedClient();
       try {
-        const proc = await ssh.spawn("head -c 2097152 /dev/zero; printf tail >&2", {
+        const proc = await ssh.spawn("head -c 9437184 /dev/zero; printf tail >&2", {
           timeoutMs: 5_000,
         });
 
@@ -1271,7 +1301,7 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
           reader.releaseLock();
         }
 
-        expect(retained).toBeLessThanOrEqual(256 * 1024);
+        expect(retained).toBeLessThanOrEqual(8 * 1024 * 1024);
         expect(error).toBeInstanceOf(SSHError);
         expect(error).toMatchObject({
           code: "ERR_SSH_OUTPUT_LIMIT",

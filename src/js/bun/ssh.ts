@@ -700,6 +700,11 @@ function createOperation(signal: AbortSignal | undefined, timeoutMs: number, pha
 
   return {
     signal: controller.signal,
+    abort(reason: unknown) {
+      if (!controller.signal.aborted) {
+        controller.abort(reason);
+      }
+    },
     cleanup() {
       if (timer !== null) {
         clearTimeout(timer);
@@ -1119,6 +1124,7 @@ class SSH {
   #connectWaiters = 0;
   #phase = "handshake";
   #activeChannels = 0;
+  #activeOperations = new Set();
   #queue = [];
   #closeDeadline = 0;
   #closeForceRequested = false;
@@ -1240,9 +1246,10 @@ class SSH {
     const startedAt = performance.now();
     let phase = execOptions.signal?.aborted ? "exec" : "handshake";
     const operation = createOperation(execOptions.signal, execOptions.timeoutMs, () => phase);
+    const releaseOperation = this.#registerOperation(operation);
     return this.#exec(commandBytes, execOptions, operation, startedAt, value => {
       phase = value;
-    });
+    }, releaseOperation);
   }
 
   spawn(command: string, options?: unknown): Promise<SSHProcess> {
@@ -1258,9 +1265,10 @@ class SSH {
     const startedAt = performance.now();
     let phase = spawnOptions.signal?.aborted ? "exec" : "handshake";
     const operation = createOperation(spawnOptions.signal, spawnOptions.timeoutMs, () => phase);
+    const releaseOperation = this.#registerOperation(operation);
     return this.#spawn(commandBytes, spawnOptions, operation, startedAt, value => {
       phase = value;
-    });
+    }, releaseOperation);
   }
 
   async #spawn(
@@ -1269,6 +1277,7 @@ class SSH {
     operation,
     startedAt: number,
     setPhase: (phase: string) => void,
+    releaseOperation: () => void,
   ): Promise<SSHProcess> {
     const signal = operation.signal;
     let release = null;
@@ -1298,13 +1307,25 @@ class SSH {
       setPhase("queue");
       release = await this.#acquireChannel(signal, this.#options.queueTimeoutMs);
       setPhase("exec");
-      if (signal.aborted) {
-        throw abortError(signal, "exec");
+      if (signal.aborted || this.#state !== "ready") {
+        throw signal.aborted
+          ? abortError(signal, "exec")
+          : new SSHError("Bun.SSH was closed before the process started", {
+              code: "ERR_SSH_CLOSED",
+              phase: "exec",
+              remoteExecution: "not-started",
+            });
       }
 
       const stdin = options.stdinMode === "data" ? await readExecInput(options.stdinData, signal) : EMPTY_BYTES;
-      if (signal.aborted) {
-        throw abortError(signal, "exec");
+      if (signal.aborted || this.#state !== "ready") {
+        throw signal.aborted
+          ? abortError(signal, "exec")
+          : new SSHError("Bun.SSH was closed before the process started", {
+              code: "ERR_SSH_CLOSED",
+              phase: "exec",
+              remoteExecution: "not-started",
+            });
       }
 
       let remainingTimeout = 0;
@@ -1352,7 +1373,11 @@ class SSH {
         throw abortError(signal, "exec");
       }
 
-      const process = new SSHProcess(nativeProcess, options, operation, release, error => {
+      const channelRelease = release;
+      const process = new SSHProcess(nativeProcess, options, operation, () => {
+        channelRelease();
+        releaseOperation();
+      }, error => {
         this.#markPeerClosed(error);
       });
       transferred = true;
@@ -1367,6 +1392,7 @@ class SSH {
     } finally {
       if (!transferred) {
         operation.cleanup();
+        releaseOperation();
         if (release !== null) {
           release();
         }
@@ -1380,6 +1406,7 @@ class SSH {
     operation,
     startedAt: number,
     setPhase: (phase: string) => void,
+    releaseOperation: () => void,
   ): Promise<SSHResult> {
     const signal = operation.signal;
     let release = null;
@@ -1414,13 +1441,25 @@ class SSH {
       setPhase("queue");
       release = await this.#acquireChannel(signal, this.#options.queueTimeoutMs);
       setPhase("exec");
-      if (signal.aborted) {
-        throw abortError(signal, "exec");
+      if (signal.aborted || this.#state !== "ready") {
+        throw signal.aborted
+          ? abortError(signal, "exec")
+          : new SSHError("Bun.SSH was closed before the command started", {
+              code: "ERR_SSH_CLOSED",
+              phase: "exec",
+              remoteExecution: "not-started",
+            });
       }
 
       const stdin = await readExecInput(options.stdin, signal);
-      if (signal.aborted) {
-        throw abortError(signal, "exec");
+      if (signal.aborted || this.#state !== "ready") {
+        throw signal.aborted
+          ? abortError(signal, "exec")
+          : new SSHError("Bun.SSH was closed before the command started", {
+              code: "ERR_SSH_CLOSED",
+              phase: "exec",
+              remoteExecution: "not-started",
+            });
       }
 
       let remainingTimeout = 0;
@@ -1503,6 +1542,7 @@ class SSH {
       throw operationId === "" ? normalized : retagOperation(normalized, operationId);
     } finally {
       operation.cleanup();
+      releaseOperation();
       if (release !== null) {
         release();
       }
@@ -1593,6 +1633,33 @@ class SSH {
       signal.addEventListener("abort", onAbort, { once: true });
       this.#queue.push(entry);
     });
+  }
+
+  #registerOperation(operation): () => void {
+    this.#activeOperations.add(operation);
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.#activeOperations.delete(operation);
+    };
+  }
+
+  #abortActiveOperations(
+    error = new SSHError("Bun.SSH was closed before the operation completed", {
+      code: "ERR_SSH_ABORTED",
+      phase: "exec",
+      remoteExecution: "may-have-started",
+    }),
+  ) {
+    if (this.#activeOperations.size === 0) {
+      return;
+    }
+    for (const operation of this.#activeOperations) {
+      operation.abort(error);
+    }
   }
 
   #channelRelease(): () => void {
@@ -1834,6 +1901,9 @@ class SSH {
     if (!forced && this.#activeChannels !== 0) {
       forced = !(await this.#waitForChannels());
     }
+    if (forced) {
+      this.#abortActiveOperations();
+    }
 
     let result = snapshotRecord({ forced: false });
     const native = this.#native;
@@ -1934,11 +2004,18 @@ class SSH {
     this.#stopLivenessMonitor();
     this.#state = "closed";
     this.#native = null;
-    this.#rejectQueued(
+    const queuedError = new SSHError("SSH connection was lost", {
+      code: "ERR_SSH_CONNECTION_LOST",
+      phase: "io",
+      remoteExecution: "not-started",
+      cause: error,
+    });
+    this.#rejectQueued(queuedError);
+    this.#abortActiveOperations(
       new SSHError("SSH connection was lost", {
         code: "ERR_SSH_CONNECTION_LOST",
         phase: "io",
-        remoteExecution: "not-started",
+        remoteExecution: "may-have-started",
         cause: error,
       }),
     );

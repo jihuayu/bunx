@@ -8,7 +8,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
 use crate::session::{ExecCancelReceiver, ExitStatus, RemoteExecution};
 
-const MAX_OUTPUT_STREAM_BYTES: usize = 256 * 1024;
+const MAX_OUTPUT_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const INPUT_QUEUE_CAPACITY: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
