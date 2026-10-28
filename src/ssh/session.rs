@@ -577,10 +577,14 @@ impl Session {
             let handle = handle
                 .as_ref()
                 .ok_or_else(|| exec_channel_error("SSH session is closed"))?;
-            handle
-                .channel_open_session()
-                .await
-                .map_err(|error| exec_channel_error(error.to_string()))?
+            tokio::select! {
+                result = handle.channel_open_session() => {
+                    result.map_err(|error| exec_channel_error(error.to_string()))?
+                }
+                stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                    return Err(exec_stop_error(stop, PartialExec::new()));
+                }
+            }
         };
 
         channel
@@ -1301,6 +1305,13 @@ mod tests {
 
     struct TestServer {
         attempts: Arc<AtomicUsize>,
+        channel_gate: Option<Arc<ChannelGate>>,
+    }
+
+    struct ChannelGate {
+        opened: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        opens: AtomicUsize,
     }
 
     impl server::Server for TestServer {
@@ -1309,12 +1320,14 @@ mod tests {
         fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
             TestHandler {
                 attempts: Arc::clone(&self.attempts),
+                channel_gate: self.channel_gate.clone(),
             }
         }
     }
 
     struct TestHandler {
         attempts: Arc<AtomicUsize>,
+        channel_gate: Option<Arc<ChannelGate>>,
     }
 
     impl server::Handler for TestHandler {
@@ -1326,6 +1339,12 @@ mod tests {
             reply: server::ChannelOpenHandle,
             _session: &mut server::Session,
         ) -> Result<(), Self::Error> {
+            if let Some(gate) = &self.channel_gate {
+                if gate.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                    gate.opened.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             reply.accept().await;
             Ok(())
         }
@@ -1364,6 +1383,12 @@ mod tests {
         ) -> Result<(), Self::Error> {
             session.channel_success(channel)?;
             match data {
+                b"gated-ok" => {
+                    session.data(channel, "ok")?;
+                    session.exit_status_request(channel, 0)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
                 b"no-status" => {
                     session.data(channel, "tail")?;
                     session.eof(channel)?;
@@ -1399,7 +1424,9 @@ mod tests {
         }
     }
 
-    async fn start_server() -> RunningServer {
+    async fn start_server_with_channel_gate(
+        channel_gate: Option<Arc<ChannelGate>>,
+    ) -> RunningServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519).unwrap();
@@ -1418,6 +1445,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut server = TestServer {
             attempts: Arc::clone(&attempts),
+            channel_gate: channel_gate.clone(),
         };
         let task = tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -1428,6 +1456,10 @@ mod tests {
             attempts,
             task,
         }
+    }
+
+    async fn start_server() -> RunningServer {
+        start_server_with_channel_gate(None).await
     }
 
     struct BlockingServer {
@@ -1458,7 +1490,10 @@ mod tests {
         config.methods.push(russh::MethodKind::Password);
         let config = Arc::new(config);
         let attempts = Arc::new(AtomicUsize::new(0));
-        let mut server = TestServer { attempts };
+        let mut server = TestServer {
+            attempts,
+            channel_gate: None,
+        };
         runtime.spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
         });
@@ -1686,6 +1721,49 @@ mod tests {
         let result = session.close().await.unwrap();
         assert!(!result.forced);
         assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn exec_cancellation_interrupts_a_pending_channel_open() {
+        let gate = Arc::new(ChannelGate {
+            opened: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            opens: AtomicUsize::new(0),
+        });
+        let server = start_server_with_channel_gate(Some(Arc::clone(&gate))).await;
+        let config = config(&server, known_hosts(&server), password_auth());
+        let session = connect(&config).await.unwrap();
+        session.authenticate(&config).await.unwrap();
+
+        let (cancel_sender, cancel) = exec_cancellation();
+        let task_session = session.clone();
+        let task = tokio::spawn(async move {
+            task_session
+                .exec_with_cancel(b"gated-ok".to_vec(), Vec::new(), None, 1024, cancel)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), gate.opened.notified())
+            .await
+            .expect("server did not receive the first channel open");
+        cancel_sender.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled channel open did not settle")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), "ERR_SSH_ABORTED");
+        assert_eq!(error.phase(), "exec");
+
+        gate.release.notify_one();
+        let (_cancel_sender, cancel) = exec_cancellation();
+        let result = session
+            .exec_with_cancel(b"gated-ok".to_vec(), Vec::new(), None, 1024, cancel)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, b"ok");
+        assert_eq!(result.exit_status, ExitStatus::Exit { code: 0 });
+        session.close().await.unwrap();
     }
 
     #[test]
