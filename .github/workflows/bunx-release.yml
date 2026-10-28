@@ -76,6 +76,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Provision glibc sysroot
+        if: matrix.abi == 'gnu'
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: bun scripts/build/ci-images/provision-glibc-sysroot.ts "${TARGET_ARCH}"
+
       - name: Provision musl sysroot
         if: matrix.abi == 'musl'
         env:
