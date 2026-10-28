@@ -579,17 +579,12 @@ export function cargoBuildInvocation(cfg: Config): CargoInvocation {
   // Rust dependencies with C build scripts get their compiler from CC/CXX,
   // but `/winsysroot` is a clang-cl flag: cc-rs can fall back to GNU-style
   // clang (ring does on aarch64-pc-windows-msvc), where the flag is treated
-  // as an input path. Pass the actual MSVC/SDK includes in the target flags
-  // both modes understand.
+  // as an input path. INCLUDE is the MSVC SDK variable both drivers read and
+  // avoids CFLAGS' whitespace tokenization, which cannot represent the
+  // "Windows Kits" directory in the xwin layout.
   if (cfg.windows && cfg.host.os !== "windows" && cfg.winsysroot !== undefined) {
-    const includeFlags = windowsSysrootIncludeDirs(cfg.winsysroot)
-      .map(dir => `-I${JSON.stringify(dir)}`)
-      .join(" ");
-    if (includeFlags.length > 0) {
-      const tripleEnv = triple.replace(/-/g, "_");
-      unitEnv[`CFLAGS_${tripleEnv}`] = includeFlags;
-      unitEnv[`CXXFLAGS_${tripleEnv}`] = includeFlags;
-    }
+    const includeDirs = windowsSysrootIncludeDirs(cfg.winsysroot);
+    if (includeDirs.length > 0) unitEnv.INCLUDE = includeDirs.join(";");
   }
 
   // The linker for target units (cargo: `CARGO_TARGET_<TRIPLE>_LINKER`). The `bun_runtime` artifact is a staticlib

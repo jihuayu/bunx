@@ -159,7 +159,7 @@ describe.skipIf(isWindows)("Windows cross-compile LTO config (non-windows host)"
     expect(rustTarget(resolveWindowsCross({ arch: "aarch64" }))).toBe("aarch64-pc-windows-msvc");
   });
 
-  test("Rust C build scripts get the MSVC and SDK include paths", async () => {
+  test("Rust C build scripts get the MSVC and SDK include paths", () => {
     using dir = tempDir("bunx-winsysroot", {});
     const root = String(dir);
     const msvcInclude = join(root, "VC", "Tools", "MSVC", "14.44.35207", "include");
@@ -168,10 +168,9 @@ describe.skipIf(isWindows)("Windows cross-compile LTO config (non-windows host)"
     for (const path of [msvcInclude, ...sdkIncludes]) mkdirSync(path, { recursive: true });
 
     const invocation = cargoBuildInvocation(resolveWindowsCross({ arch: "aarch64", winsysroot: root }));
-    const key = "CFLAGS_aarch64_pc_windows_msvc";
-    const expected = [msvcInclude, ...sdkIncludes].map(path => `-I${JSON.stringify(path)}`).join(" ");
-    expect(invocation.unitEnv[key]).toBe(expected);
-    expect(invocation.unitEnv.CXXFLAGS_aarch64_pc_windows_msvc).toBe(expected);
+    expect(invocation.unitEnv.INCLUDE).toBe([msvcInclude, ...sdkIncludes].join(";"));
+    expect(invocation.unitEnv.CFLAGS_aarch64_pc_windows_msvc).toBeUndefined();
+    expect(invocation.unitEnv.CXXFLAGS_aarch64_pc_windows_msvc).toBeUndefined();
   });
 
   test("linux LTO config uses ThinLTO with WPD and no-split-lto-unit", () => {
