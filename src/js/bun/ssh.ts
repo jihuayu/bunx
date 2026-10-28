@@ -128,6 +128,34 @@ function abortError(signal: AbortSignal, phase: string): SSHError {
   return runtimeError("SSH operation was aborted", "ERR_SSH_ABORTED", phase, reason);
 }
 
+function abortErrorWithDetails(
+  signal: AbortSignal,
+  phase: string,
+  details?: {
+    operationId?: string;
+    remoteExecution?: string;
+    status?: object;
+    stdout?: Uint8Array;
+    stderr?: Uint8Array;
+    cause?: unknown;
+  },
+): SSHError {
+  const error = abortError(signal, phase);
+  if (details === undefined) {
+    return error;
+  }
+  return new SSHError(error.message, {
+    code: error.code,
+    phase: error.phase,
+    operationId: details.operationId,
+    remoteExecution: details.remoteExecution,
+    status: details.status,
+    stdout: details.stdout,
+    stderr: details.stderr,
+    cause: details.cause ?? error.cause,
+  });
+}
+
 function normalizeError(error: unknown, fallbackCode: string, fallbackPhase: string): SSHError {
   if (error instanceof SSHError) {
     return error;
@@ -1511,39 +1539,43 @@ class SSH {
         releaseChannel();
       };
       Promise.resolve(nativePromise).then(releaseAfterNativeCleanup, releaseAfterNativeCleanup);
-      const resultPromise = new Promise((resolve, reject) => {
-        function onAbort() {
-          native.cancelOperation(nativeOperation.id);
-          reject(abortError(signal, "exec"));
-        }
-        if (signal.aborted) {
-          onAbort();
-          return;
-        }
+      const onAbort = () => {
+        native.cancelOperation(nativeOperation.id);
+      };
+      if (signal.aborted) {
+        onAbort();
+      } else {
         signal.addEventListener("abort", onAbort, { once: true });
-        Promise.resolve(nativePromise).then(
-          value => {
-            signal.removeEventListener("abort", onAbort);
-            if (signal.aborted) {
-              reject(abortError(signal, "exec"));
-            } else {
-              resolve(value);
-            }
-          },
-          error => {
-            signal.removeEventListener("abort", onAbort);
-            reject(error);
-          },
-        );
-      });
+      }
 
       let nativeResult;
       try {
-        nativeResult = await resultPromise;
+        nativeResult = await Promise.resolve(nativePromise);
       } catch (error) {
-        throw retagOperation(normalizeError(error, "ERR_SSH_IO", "exec"), operationId);
+        const normalized = normalizeError(error, "ERR_SSH_IO", "exec");
+        throw signal.aborted
+          ? abortErrorWithDetails(signal, "exec", {
+              operationId: normalized.operationId,
+              remoteExecution: normalized.remoteExecution,
+              status: normalized.status,
+              stdout: normalized.stdout,
+              stderr: normalized.stderr,
+              cause: normalized.cause,
+            })
+          : normalized;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
       }
       const result = resultFromNative(nativeResult, performance.now() - startedAt);
+      if (signal.aborted) {
+        throw abortErrorWithDetails(signal, "exec", {
+          operationId,
+          remoteExecution: result.remoteExecution,
+          status: result.status,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        });
+      }
 
       if (result.status.type === "unknown") {
         throw exitError(

@@ -14,6 +14,9 @@ use crate::process::{BlockingProcess, OutputBudget, ProcessConfig, start_driver}
 
 const MAX_INITIAL_CHANNEL_MESSAGES: usize = 256;
 const MAX_INITIAL_CHANNEL_BYTES: usize = 256 * 1024;
+const STOP_OUTPUT_DRAIN_MESSAGES: usize = 256;
+const STOP_OUTPUT_DRAIN_BYTES: usize = 256 * 1024;
+const STOP_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub type ExecCancelSender = watch::Sender<bool>;
 pub type ExecCancelReceiver = watch::Receiver<bool>;
@@ -681,12 +684,15 @@ impl Session {
         let (reply_sender, reply_receiver) = oneshot::channel();
         let (done_sender, mut done_receiver) = watch::channel(false);
         let reader_budget = output_budget.clone();
+        let mut reader_cancel = cancel.clone();
         let mut reader = tokio::spawn(async move {
             let output = read_exec_output(
                 &mut read_half,
                 max_output_bytes,
                 reader_budget,
                 reply_sender,
+                &mut reader_cancel,
+                deadline,
             )
             .await;
             let _ = done_sender.send(true);
@@ -695,15 +701,18 @@ impl Session {
 
         let reply = tokio::select! {
             biased;
-            reply = reply_receiver => reply,
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                reader.abort();
-                close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
+                return Err(stop_exec(
+                    stop,
+                    &write_half,
+                    &mut reader,
+                    output_budget.clone(),
+                ).await);
             }
+            reply = reply_receiver => reply,
             _ = done_receiver.changed() => {
-                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
-                close_exec_channel(&write_half).await;
+                let output =
+                    close_and_finish_exec(&write_half, &mut reader, output_budget.clone()).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_PROTOCOL",
                     "exec",
@@ -716,21 +725,22 @@ impl Session {
         match reply {
             Ok(ExecReply::Accepted) => {}
             Ok(ExecReply::Rejected) => {
-                reader.abort();
-                close_exec_channel(&write_half).await;
+                let output =
+                    close_and_finish_exec(&write_half, &mut reader, output_budget.clone()).await;
+                let (stdout, stderr, _, _) = output.output.into_parts();
                 return Err(ExecError {
                     code: "ERR_SSH_EXEC_REJECTED",
                     phase: "exec",
                     message: "SSH server rejected the exec request".into(),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
+                    stdout,
+                    stderr,
                     exit_status: ExitStatus::Unknown,
                     remote_execution: RemoteExecution::NotStarted,
                 });
             }
             Err(_) => {
-                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
-                close_exec_channel(&write_half).await;
+                let output =
+                    close_and_finish_exec(&write_half, &mut reader, output_budget.clone()).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_PROTOCOL",
                     "exec",
@@ -742,18 +752,21 @@ impl Session {
 
         if !stdin.is_empty() {
             let write_result = tokio::select! {
-                result = write_half.data_bytes(stdin) => Some(result),
+                biased;
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                    reader.abort();
-                    close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
+                    return Err(stop_exec(
+                        stop,
+                        &write_half,
+                        &mut reader,
+                        output_budget.clone(),
+                    ).await);
                 }
+                result = write_half.data_bytes(stdin) => Some(result),
                 _ = done_receiver.changed() => None,
             };
             if let Some(Err(error)) = write_result {
-                reader.abort();
-                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
-                close_exec_channel(&write_half).await;
+                let output =
+                    close_and_finish_exec(&write_half, &mut reader, output_budget.clone()).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_IO",
                     "exec",
@@ -765,18 +778,21 @@ impl Session {
 
         if !*done_receiver.borrow() {
             let eof_result = tokio::select! {
-                result = write_half.eof() => Some(result),
+                biased;
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                    reader.abort();
-                    close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
+                    return Err(stop_exec(
+                        stop,
+                        &write_half,
+                        &mut reader,
+                        output_budget.clone(),
+                    ).await);
                 }
+                result = write_half.eof() => Some(result),
                 _ = done_receiver.changed() => None,
             };
             if let Some(Err(error)) = eof_result {
-                reader.abort();
-                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
-                close_exec_channel(&write_half).await;
+                let output =
+                    close_and_finish_exec(&write_half, &mut reader, output_budget.clone()).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_IO",
                     "exec",
@@ -787,6 +803,15 @@ impl Session {
         }
 
         let output = tokio::select! {
+            biased;
+            stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                return Err(stop_exec(
+                    stop,
+                    &write_half,
+                    &mut reader,
+                    output_budget.clone(),
+                ).await);
+            }
             result = &mut reader => match result {
                 Ok(output) => output,
                 Err(error) => {
@@ -802,11 +827,6 @@ impl Session {
                     });
                 }
             },
-            stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                reader.abort();
-                close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
-            }
         };
 
         close_exec_channel(&write_half).await;
@@ -997,14 +1017,57 @@ async fn read_exec_output(
     max_output_bytes: u64,
     output_budget: OutputBudget,
     reply: oneshot::Sender<ExecReply>,
+    cancel: &mut watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
 ) -> ReadTaskResult {
     let mut output = PartialExec::sent(output_budget);
     let mut reply = Some(reply);
     let mut clean_close = false;
     let mut output_limit = false;
     let mut resource_limit = false;
+    let mut stop_drain_deadline = None;
+    let mut stop_drain_messages = 0usize;
+    let mut stop_drain_bytes = 0usize;
 
-    while let Some(message) = read_half.wait().await {
+    loop {
+        let message = if let Some(drain_deadline) = stop_drain_deadline {
+            if stop_drain_messages >= STOP_OUTPUT_DRAIN_MESSAGES
+                || stop_drain_bytes >= STOP_OUTPUT_DRAIN_BYTES
+                || tokio::time::Instant::now() >= drain_deadline
+            {
+                break;
+            }
+            match tokio::time::timeout_at(drain_deadline, read_half.wait()).await {
+                Ok(message) => message,
+                Err(_) => break,
+            }
+        } else {
+            if executor_stopped(cancel, deadline) {
+                stop_drain_deadline = Some(tokio::time::Instant::now() + STOP_OUTPUT_DRAIN_TIMEOUT);
+                continue;
+            }
+            tokio::select! {
+                biased;
+                message = read_half.wait() => message,
+                _ = wait_for_exec_stop(cancel, deadline) => {
+                    stop_drain_deadline =
+                        Some(tokio::time::Instant::now() + STOP_OUTPUT_DRAIN_TIMEOUT);
+                    continue;
+                }
+            }
+        };
+        let Some(message) = message else {
+            break;
+        };
+        if stop_drain_deadline.is_some() {
+            stop_drain_messages += 1;
+            stop_drain_bytes = match &message {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    stop_drain_bytes.saturating_add(data.len())
+                }
+                _ => stop_drain_bytes,
+            };
+        }
         match message {
             ChannelMsg::Success => {
                 output.remote_execution = RemoteExecution::MayHaveStarted;
@@ -1090,6 +1153,32 @@ async fn read_exec_output(
         output_limit,
         resource_limit,
     }
+}
+
+fn executor_stopped(
+    cancel: &watch::Receiver<bool>,
+    deadline: Option<tokio::time::Instant>,
+) -> bool {
+    *cancel.borrow() || deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+}
+
+async fn stop_exec(
+    stop: ExecStop,
+    write_half: &russh::ChannelWriteHalf<Msg>,
+    reader: &mut tokio::task::JoinHandle<ReadTaskResult>,
+    output_budget: OutputBudget,
+) -> ExecError {
+    let output = close_and_finish_exec(write_half, reader, output_budget).await;
+    exec_stop_error(stop, output.output)
+}
+
+async fn close_and_finish_exec(
+    write_half: &russh::ChannelWriteHalf<Msg>,
+    reader: &mut tokio::task::JoinHandle<ReadTaskResult>,
+    output_budget: OutputBudget,
+) -> ReadTaskResult {
+    close_exec_channel(write_half).await;
+    finish_exec_reader(reader, output_budget).await
 }
 
 async fn wait_for_exec_stop(
@@ -1604,6 +1693,11 @@ mod tests {
             }
             session.channel_success(channel)?;
             match data {
+                b"output-then-stall" => {
+                    session.data(channel, "partial")?;
+                    session.extended_data(channel, 1, "warning")?;
+                    session.eof(channel)?;
+                }
                 b"gated-ok" => {
                     session.data(channel, "ok")?;
                     session.exit_status_request(channel, 0)?;
@@ -2042,6 +2136,32 @@ mod tests {
             .unwrap();
         assert_eq!(result.stdout, b"ok");
         assert_eq!(result.exit_status, ExitStatus::Exit { code: 0 });
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_preserves_collected_output() {
+        let server = start_server().await;
+        let config = config(&server, known_hosts(&server), password_auth());
+        let session = connect(&config).await.unwrap();
+        session.authenticate(&config).await.unwrap();
+
+        let (_cancel_sender, cancel) = exec_cancellation();
+        let error = session
+            .exec_with_cancel(
+                b"output-then-stall".to_vec(),
+                Vec::new(),
+                Some(Duration::from_secs(1)),
+                1024,
+                cancel,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "ERR_SSH_TIMEOUT");
+        assert_eq!(error.stdout, b"partial");
+        assert_eq!(error.stderr, b"warning");
+        assert_eq!(error.remote_execution, RemoteExecution::MayHaveStarted);
+
         session.close().await.unwrap();
     }
 

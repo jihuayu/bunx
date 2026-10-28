@@ -1195,12 +1195,16 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
   test("exec timeout is distinguishable from caller cancellation", async () => {
     const ssh = await connectedClient();
     try {
-      const error = await ssh.exec("sleep 5", { timeoutMs: 100 }).catch(error => error);
+      const error = await ssh
+        .exec("printf partial; printf warning >&2; sleep 5", { timeoutMs: 500 })
+        .catch(error => error);
       expect(error).toBeInstanceOf(SSHError);
       expect(error).toMatchObject({
         code: "ERR_SSH_TIMEOUT",
         phase: "exec",
       });
+      expect(new TextDecoder().decode(error.stdout)).toBe("partial");
+      expect(new TextDecoder().decode(error.stderr)).toBe("warning");
 
       const result = await ssh.exec("printf 'after-timeout'");
       expect(result.text()).toBe("after-timeout");
