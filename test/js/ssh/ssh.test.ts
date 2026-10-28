@@ -1639,12 +1639,38 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
-  test("spawn accepts a best-effort signal while the process is running", async () => {
+  test("spawn delivers a signal to the remote process", async () => {
     const ssh = await connectedClient();
     try {
-      const proc = await ssh.spawn("cat", { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
-      await proc.sendSignal("TERM");
-      await proc.cancel();
+      const proc = await ssh.spawn("trap 'printf term; exit 0' TERM; printf ready; while :; do :; done", {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const reader = proc.stdout!.getReader();
+      let output = "";
+      try {
+        while (!output.includes("ready")) {
+          const { done, value } = await reader.read();
+          if (done) {
+            throw new Error(`remote process exited before ready: ${output}`);
+          }
+          output += new TextDecoder().decode(value);
+        }
+        expect(output).toBe("ready");
+
+        await proc.sendSignal("TERM");
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          output += new TextDecoder().decode(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      expect(output).toBe("readyterm");
+      expect(await proc.exited).toEqual({ type: "exit", code: 0 });
       await proc.closed;
     } finally {
       await ssh.close();
