@@ -600,6 +600,7 @@ impl Session {
         });
 
         let reply = tokio::select! {
+            biased;
             reply = reply_receiver => reply,
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 reader.abort();
@@ -1285,6 +1286,16 @@ mod tests {
     impl server::Handler for TestHandler {
         type Error = RusshError;
 
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
         async fn auth_password(
             &mut self,
             user: &str,
@@ -1309,6 +1320,30 @@ mod tests {
             } else {
                 ServerAuth::reject()
             })
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            match data {
+                b"no-status" => {
+                    session.data(channel, "tail")?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                }
+                b"lost-before-status" => {
+                    session.data(channel, "partial")?;
+                    session.disconnect(Disconnect::ByApplication, "", "")?;
+                }
+                _ => {
+                    session.channel_failure(channel)?;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1354,6 +1389,83 @@ mod tests {
             attempts,
             task,
         }
+    }
+
+    struct BlockingServer {
+        address: std::net::SocketAddr,
+        host_key: russh::keys::PublicKey,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    fn start_blocking_server() -> BlockingServer {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            runtime.block_on(async { TcpListener::bind(("127.0.0.1", 0)).await.unwrap() });
+        let address = listener.local_addr().unwrap();
+        let host_key = PrivateKey::random(&mut rng(), Algorithm::Ed25519).unwrap();
+        let host_public_key = host_key.public_key().clone();
+        let mut config = server::Config {
+            keys: vec![host_key],
+            inactivity_timeout: None,
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        config.methods = russh::MethodSet::empty();
+        config.methods.push(russh::MethodKind::Password);
+        let config = Arc::new(config);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut server = TestServer { attempts };
+        runtime.spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+        BlockingServer {
+            address,
+            host_key: host_public_key,
+            _runtime: runtime,
+        }
+    }
+
+    fn known_hosts_for(
+        address: std::net::SocketAddr,
+        host_key: &russh::keys::PublicKey,
+    ) -> crate::HostKeyPolicy {
+        use crate::config::KnownHostsSource;
+
+        let openssh = host_key.to_openssh().unwrap();
+        let key = openssh
+            .split_ascii_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        crate::HostKeyPolicy::KnownHosts(KnownHostsSource::new(
+            format!("[127.0.0.1]:{} {key}\n", address.port()).into_bytes(),
+        ))
+    }
+
+    fn blocking_session(server: &BlockingServer) -> BlockingSession {
+        let config = Config::new(
+            "127.0.0.1".to_string(),
+            server.address.port(),
+            USERNAME.to_string(),
+            known_hosts_for(server.address, &server.host_key),
+            password_auth(),
+            5_000,
+            5_000,
+            DEFAULT_MAX_CHANNELS,
+            DEFAULT_MAX_PENDING_OPERATIONS,
+            5_000,
+        )
+        .unwrap();
+        let session = BlockingSession::connect_transport(&config.transport()).unwrap();
+        session
+            .authenticate_with(&config.auth, USERNAME, 5_000)
+            .unwrap();
+        session
     }
 
     fn config(server: &RunningServer, host_key: crate::HostKeyPolicy, auth: Auth) -> Config {
@@ -1535,5 +1647,71 @@ mod tests {
         let result = session.close().await.unwrap();
         assert!(!result.forced);
         assert!(session.is_closed());
+    }
+
+    #[test]
+    fn clean_channel_close_without_status_is_unknown_not_success() {
+        let server = start_blocking_server();
+        let session = blocking_session(&server);
+        let (_cancel_sender, cancel) = exec_cancellation();
+
+        let result = session
+            .exec_with_cancel(b"no-status".to_vec(), Vec::new(), None, 1024, cancel)
+            .unwrap();
+        assert_eq!(result.stdout, b"tail");
+        assert_eq!(result.exit_status, ExitStatus::Unknown);
+        assert_eq!(result.remote_execution, RemoteExecution::MayHaveStarted);
+        session.close_with_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn spawned_process_without_status_reports_unknown() {
+        let server = start_blocking_server();
+        let session = blocking_session(&server);
+        let (_cancel_sender, cancel) = exec_cancellation();
+
+        let process = session
+            .start_process(
+                b"no-status".to_vec(),
+                ProcessConfig {
+                    stdin: crate::ProcessStdin::Ignore,
+                    capture_stdout: true,
+                    capture_stderr: true,
+                },
+                None,
+                cancel,
+            )
+            .unwrap();
+        assert_eq!(process.read_stdout(1024).unwrap().unwrap(), b"tail");
+        let exit = process.wait_exit().unwrap();
+        assert_eq!(exit.status, ExitStatus::Unknown);
+        assert_eq!(exit.remote_execution, RemoteExecution::MayHaveStarted);
+        process.wait_closed();
+        session.close_with_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn connection_loss_before_status_rejects_process_exit() {
+        let server = start_blocking_server();
+        let session = blocking_session(&server);
+        let (_cancel_sender, cancel) = exec_cancellation();
+
+        let process = session
+            .start_process(
+                b"lost-before-status".to_vec(),
+                ProcessConfig {
+                    stdin: crate::ProcessStdin::Ignore,
+                    capture_stdout: true,
+                    capture_stderr: true,
+                },
+                None,
+                cancel,
+            )
+            .unwrap();
+        let error = process.wait_exit().unwrap_err();
+        assert_eq!(error.code(), "ERR_SSH_CONNECTION_LOST");
+        assert_eq!(error.phase(), "io");
+        assert_eq!(error.remote_execution(), RemoteExecution::MayHaveStarted);
+        process.wait_closed();
     }
 }

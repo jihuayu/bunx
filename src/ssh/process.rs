@@ -736,9 +736,20 @@ async fn run_input_writer(
     }
 }
 
-fn writer_error(message: &str, error: impl std::fmt::Display) -> ProcessError {
+fn writer_error(message: &str, error: russh::Error) -> ProcessError {
+    let code = if matches!(
+        &error,
+        russh::Error::Disconnect
+            | russh::Error::HUP
+            | russh::Error::SendError
+            | russh::Error::IO(_)
+    ) {
+        "ERR_SSH_CONNECTION_LOST"
+    } else {
+        "ERR_SSH_IO"
+    };
     ProcessError::new(
-        "ERR_SSH_IO",
+        code,
         "io",
         format!("{message}: {error}"),
         RemoteExecution::MayHaveStarted,
