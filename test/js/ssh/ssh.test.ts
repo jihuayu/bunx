@@ -611,6 +611,21 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     });
   });
 
+  test("large safe-integer timeouts do not overflow into immediate deadlines", async () => {
+    const ssh = client({
+      connectTimeoutMs: Number.MAX_SAFE_INTEGER,
+      authenticationTimeoutMs: Number.MAX_SAFE_INTEGER,
+      queueTimeoutMs: Number.MAX_SAFE_INTEGER,
+    });
+    await ssh.connect();
+    const result = await ssh.exec("printf large-timeout", {
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+      maxOutputBytes: 64,
+    });
+    expect(result.text()).toBe("large-timeout");
+    expect(await ssh.close()).toEqual({ forced: false });
+  });
+
   test("resolves an encrypted private key passphrase only after host verification", async () => {
     let passphraseCalls = 0;
     const ssh = new SSH({

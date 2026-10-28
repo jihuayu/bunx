@@ -24,6 +24,7 @@ const MAX_COMMAND_BYTES = 64 * 1024;
 const MAX_EXEC_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_PROCESS_CHUNK_BYTES = 64 * 1024;
 const LIVENESS_CHECK_INTERVAL_MS = 500;
+const MAX_TIMER_DELAY_MS = 0x7fff_ffff;
 const EMPTY_BYTES = new Uint8Array();
 const NativeSSHConnection = $bindgen("ssh_jsc.bind.ts", "SSHConnection");
 const textEncoder = new TextEncoder();
@@ -553,6 +554,35 @@ function withAbort<T>(promise: PromiseLike<T> | T, signal: AbortSignal, phase: (
   });
 }
 
+function setDeadlineTimer(delayMs: number, callback: () => void) {
+  const deadline = performance.now() + delayMs;
+  let timer = null;
+  let active = true;
+  const arm = () => {
+    if (!active) {
+      return;
+    }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      active = false;
+      timer = null;
+      callback();
+      return;
+    }
+    timer = setTimeout(arm, Math.min(Math.ceil(remaining), MAX_TIMER_DELAY_MS));
+  };
+  arm();
+  return {
+    clear() {
+      active = false;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
 function copyRuntimeBytes(value: Uint8Array, path: string, phase: string): Uint8Array {
   try {
     return new Uint8Array(value);
@@ -692,9 +722,8 @@ function createOperation(signal: AbortSignal | undefined, timeoutMs: number, pha
     }
   }
   if (timeoutMs !== 0 && !controller.signal.aborted) {
-    timer = setTimeout(
-      () => controller.abort(runtimeError("SSH operation timed out", "ERR_SSH_TIMEOUT", phase())),
-      timeoutMs,
+    timer = setDeadlineTimer(timeoutMs, () =>
+      controller.abort(runtimeError("SSH operation timed out", "ERR_SSH_TIMEOUT", phase())),
     );
   }
 
@@ -707,7 +736,7 @@ function createOperation(signal: AbortSignal | undefined, timeoutMs: number, pha
     },
     cleanup() {
       if (timer !== null) {
-        clearTimeout(timer);
+        timer.clear();
         timer = null;
       }
       if (signal !== undefined) {
@@ -1582,7 +1611,7 @@ class SSH {
       let settled = false;
       const cleanup = () => {
         if (timer !== null) {
-          clearTimeout(timer);
+          timer.clear();
         }
         signal.removeEventListener("abort", onAbort);
       };
@@ -1607,7 +1636,7 @@ class SSH {
       const timer =
         queueTimeoutMs === 0
           ? null
-          : setTimeout(() => {
+          : setDeadlineTimer(queueTimeoutMs, () => {
               fail(
                 new SSHError("Bun.SSH operation timed out waiting for an SSH channel", {
                   code: "ERR_SSH_QUEUE_TIMEOUT",
@@ -1615,7 +1644,7 @@ class SSH {
                   remoteExecution: "not-started",
                 }),
               );
-            }, queueTimeoutMs);
+            });
 
       entry.resolve = () => {
         if (settled) {
@@ -1717,7 +1746,10 @@ class SSH {
     let authTimer = null;
 
     try {
-      connectTimer = setTimeout(() => operation.abort(CONNECT_TIMEOUT), this.#options.connectTimeoutMs);
+      connectTimer = setDeadlineTimer(
+        this.#options.connectTimeoutMs,
+        () => operation.abort(CONNECT_TIMEOUT),
+      );
       const hostKey = this.#options.hostKey;
       let knownHosts = EMPTY_BYTES;
       let pins = null;
@@ -1750,13 +1782,16 @@ class SSH {
       }
       transportAdopted = true;
 
-      clearTimeout(connectTimer);
+      connectTimer.clear();
       connectTimer = null;
       this.#phase = "auth";
       const authStartedAt = performance.now();
-      authTimer = setTimeout(() => operation.abort(AUTH_TIMEOUT), this.#options.authenticationTimeoutMs);
+      authTimer = setDeadlineTimer(
+        this.#options.authenticationTimeoutMs,
+        () => operation.abort(AUTH_TIMEOUT),
+      );
       await this.#authenticate(native, signal, authStartedAt);
-      clearTimeout(authTimer);
+      authTimer.clear();
       authTimer = null;
 
       if (signal.aborted || this.#state !== "connecting") {
@@ -1794,10 +1829,10 @@ class SSH {
       throw error;
     } finally {
       if (connectTimer !== null) {
-        clearTimeout(connectTimer);
+        connectTimer.clear();
       }
       if (authTimer !== null) {
-        clearTimeout(authTimer);
+        authTimer.clear();
       }
       this.#operationAbort = null;
     }
@@ -1945,7 +1980,7 @@ class SSH {
           }
           settled = true;
           if (timer !== null) {
-            clearTimeout(timer);
+            timer.clear();
           }
           if (this.#closeWake === wake) {
             this.#closeWake = null;
@@ -1953,7 +1988,7 @@ class SSH {
           resolve();
         };
         this.#closeWake = wake;
-        timer = setTimeout(wake, remaining);
+        timer = setDeadlineTimer(remaining, wake);
       });
     }
     return this.#activeChannels === 0 && !this.#closeForceRequested;
