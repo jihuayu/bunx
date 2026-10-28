@@ -526,6 +526,9 @@ export function binaryExpectations(cfg: Config): BinaryExpectations {
             "WSOCK32.dll",
             "api-ms-win-core-synch-l1-2-0.dll",
             "bcryptprimitives.dll",
+            // russh's Windows SSH agent support (pageant -> windows-core)
+            // activates COM through combase.dll, part of every supported Windows.
+            "combase.dll",
             "dbghelp.dll",
             "ntdll.dll",
             "ole32.dll",
