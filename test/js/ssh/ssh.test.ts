@@ -1026,6 +1026,31 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test(
+    "exec shares the connection output budget",
+    async () => {
+      const ssh = await connectedClient();
+      try {
+        const bytes = 32 * 1024 * 1024 + 1;
+        const error = await ssh
+          .exec(`head -c ${bytes} /dev/zero`, {
+            maxOutputBytes: bytes,
+            timeoutMs: 15_000,
+          })
+          .catch(error => error);
+        expect(error).toBeInstanceOf(SSHError);
+        expect(error).toMatchObject({
+          code: "ERR_SSH_RESOURCE_LIMIT",
+          phase: "exec",
+        });
+        expect(error.stdout.byteLength).toBeLessThanOrEqual(32 * 1024 * 1024);
+      } finally {
+        await ssh.close();
+      }
+    },
+    15_000,
+  );
+
   test("exec drains large stdout and stderr concurrently", async () => {
     const ssh = await connectedClient();
     try {

@@ -229,37 +229,46 @@ struct PartialExec {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     total_output: u64,
+    reserved_output: usize,
     exit_status: ExitStatus,
     remote_execution: RemoteExecution,
+    output_budget: OutputBudget,
 }
 
 impl PartialExec {
-    fn new() -> Self {
+    fn new(output_budget: OutputBudget) -> Self {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
             total_output: 0,
+            reserved_output: 0,
             exit_status: ExitStatus::Unknown,
             remote_execution: RemoteExecution::NotStarted,
+            output_budget,
         }
     }
 
-    fn sent() -> Self {
-        Self {
-            remote_execution: RemoteExecution::MayHaveStarted,
-            ..Self::new()
-        }
+    fn sent(output_budget: OutputBudget) -> Self {
+        let mut output = Self::new(output_budget);
+        output.remote_execution = RemoteExecution::MayHaveStarted;
+        output
     }
 
-    fn push(&mut self, stderr: bool, data: &[u8], max_output_bytes: u64) -> bool {
+    fn push(&mut self, stderr: bool, data: &[u8], max_output_bytes: u64) -> PartialExecPush {
         let Ok(data_len) = u64::try_from(data.len()) else {
-            return false;
+            return PartialExecPush::OutputLimit;
         };
         let Some(total) = self.total_output.checked_add(data_len) else {
-            return false;
+            return PartialExecPush::OutputLimit;
         };
         if total > max_output_bytes {
-            return false;
+            return PartialExecPush::OutputLimit;
+        }
+        let Some(reserved) = self.reserved_output.checked_add(data.len()) else {
+            return PartialExecPush::ResourceLimit;
+        };
+        if !self.output_budget.try_reserve(data.len()) {
+            return PartialExecPush::ResourceLimit;
         }
         let target = if stderr {
             &mut self.stderr
@@ -268,7 +277,24 @@ impl PartialExec {
         };
         target.extend_from_slice(data);
         self.total_output = total;
-        true
+        self.reserved_output = reserved;
+        PartialExecPush::Accepted
+    }
+
+    fn release_output_budget(&mut self) {
+        self.output_budget.release(self.reserved_output);
+        self.reserved_output = 0;
+    }
+
+    fn into_parts(mut self) -> (Vec<u8>, Vec<u8>, ExitStatus, RemoteExecution) {
+        let remote_execution = self.remote_execution();
+        self.release_output_budget();
+        (
+            std::mem::take(&mut self.stdout),
+            std::mem::take(&mut self.stderr),
+            self.exit_status.clone(),
+            remote_execution,
+        )
     }
 
     fn remote_execution(&self) -> RemoteExecution {
@@ -282,6 +308,18 @@ impl PartialExec {
     }
 }
 
+impl Drop for PartialExec {
+    fn drop(&mut self) {
+        self.release_output_budget();
+    }
+}
+
+enum PartialExecPush {
+    Accepted,
+    OutputLimit,
+    ResourceLimit,
+}
+
 #[derive(Debug)]
 enum ExecReply {
     Accepted,
@@ -292,6 +330,7 @@ struct ReadTaskResult {
     output: PartialExec,
     clean_close: bool,
     output_limit: bool,
+    resource_limit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -577,6 +616,7 @@ impl Session {
         max_output_bytes: u64,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<ExecResult, ExecError> {
+        let output_budget = self.inner.output_budget.clone();
         if *cancel.borrow() {
             return Err(ExecError {
                 code: "ERR_SSH_ABORTED",
@@ -612,7 +652,7 @@ impl Session {
                     result.map_err(|error| exec_channel_error(error.to_string()))?
                 }
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                    return Err(exec_stop_error(stop, PartialExec::new()));
+                    return Err(exec_stop_error(stop, PartialExec::new(output_budget.clone())));
                 }
             }
         };
@@ -621,7 +661,7 @@ impl Session {
             result = channel.exec(true, command) => result,
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 let _ = tokio::time::timeout(Duration::from_millis(250), channel.close()).await;
-                return Err(exec_stop_error(stop, PartialExec::sent()));
+                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
             }
         };
         if let Err(error) = exec_result {
@@ -640,8 +680,15 @@ impl Session {
         let (mut read_half, write_half) = channel.split();
         let (reply_sender, reply_receiver) = oneshot::channel();
         let (done_sender, mut done_receiver) = watch::channel(false);
+        let reader_budget = output_budget.clone();
         let mut reader = tokio::spawn(async move {
-            let output = read_exec_output(&mut read_half, max_output_bytes, reply_sender).await;
+            let output = read_exec_output(
+                &mut read_half,
+                max_output_bytes,
+                reader_budget,
+                reply_sender,
+            )
+            .await;
             let _ = done_sender.send(true);
             output
         });
@@ -652,10 +699,10 @@ impl Session {
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 reader.abort();
                 close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::sent()));
+                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
             }
             _ = done_receiver.changed() => {
-                let output = finish_exec_reader(&mut reader).await;
+                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
                 close_exec_channel(&write_half).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_PROTOCOL",
@@ -682,7 +729,7 @@ impl Session {
                 });
             }
             Err(_) => {
-                let output = finish_exec_reader(&mut reader).await;
+                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
                 close_exec_channel(&write_half).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_PROTOCOL",
@@ -699,13 +746,13 @@ impl Session {
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
                     reader.abort();
                     close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::sent()));
+                    return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
                 }
                 _ = done_receiver.changed() => None,
             };
             if let Some(Err(error)) = write_result {
                 reader.abort();
-                let output = finish_exec_reader(&mut reader).await;
+                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
                 close_exec_channel(&write_half).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_IO",
@@ -722,13 +769,13 @@ impl Session {
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
                     reader.abort();
                     close_exec_channel(&write_half).await;
-                    return Err(exec_stop_error(stop, PartialExec::sent()));
+                    return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
                 }
                 _ = done_receiver.changed() => None,
             };
             if let Some(Err(error)) = eof_result {
                 reader.abort();
-                let output = finish_exec_reader(&mut reader).await;
+                let output = finish_exec_reader(&mut reader, output_budget.clone()).await;
                 close_exec_channel(&write_half).await;
                 return Err(exec_error_from_reader(
                     "ERR_SSH_IO",
@@ -758,12 +805,23 @@ impl Session {
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 reader.abort();
                 close_exec_channel(&write_half).await;
-                return Err(exec_stop_error(stop, PartialExec::sent()));
+                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
             }
         };
 
         close_exec_channel(&write_half).await;
 
+        if output.resource_limit {
+            return Err(exec_error_from_reader(
+                "ERR_SSH_RESOURCE_LIMIT",
+                "exec",
+                format!(
+                    "SSH connection output budget of {} bytes was exceeded",
+                    output.output.output_budget.limit()
+                ),
+                output,
+            ));
+        }
         if output.output_limit {
             return Err(exec_error_from_reader(
                 "ERR_SSH_OUTPUT_LIMIT",
@@ -781,11 +839,11 @@ impl Session {
             ));
         }
 
-        let remote_execution = output.output.remote_execution();
+        let (stdout, stderr, exit_status, remote_execution) = output.output.into_parts();
         Ok(ExecResult {
-            stdout: output.output.stdout,
-            stderr: output.output.stderr,
-            exit_status: output.output.exit_status,
+            stdout,
+            stderr,
+            exit_status,
             remote_execution,
         })
     }
@@ -798,6 +856,7 @@ impl Session {
         mut cancel: watch::Receiver<bool>,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<BlockingProcess, ExecError> {
+        let output_budget = self.inner.output_budget.clone();
         if *cancel.borrow() {
             return Err(ExecError::new(
                 "ERR_SSH_ABORTED",
@@ -832,7 +891,7 @@ impl Session {
                     ))?
                 }
                 stop = wait_for_exec_stop(&mut cancel, deadline) => {
-                    return Err(exec_stop_error(stop, PartialExec::new()));
+                    return Err(exec_stop_error(stop, PartialExec::new(output_budget.clone())));
                 }
             }
         };
@@ -851,7 +910,7 @@ impl Session {
             }
             stop = wait_for_exec_stop(&mut cancel, deadline) => {
                 let _ = channel.close().await;
-                return Err(exec_stop_error(stop, PartialExec::sent()));
+                return Err(exec_stop_error(stop, PartialExec::sent(output_budget.clone())));
             }
         }
 
@@ -936,12 +995,14 @@ impl Session {
 async fn read_exec_output(
     read_half: &mut russh::ChannelReadHalf,
     max_output_bytes: u64,
+    output_budget: OutputBudget,
     reply: oneshot::Sender<ExecReply>,
 ) -> ReadTaskResult {
-    let mut output = PartialExec::sent();
+    let mut output = PartialExec::sent(output_budget);
     let mut reply = Some(reply);
     let mut clean_close = false;
     let mut output_limit = false;
+    let mut resource_limit = false;
 
     while let Some(message) = read_half.wait().await {
         match message {
@@ -959,22 +1020,42 @@ async fn read_exec_output(
             }
             ChannelMsg::Data { data } => {
                 output.remote_execution = RemoteExecution::MayHaveStarted;
-                if !output.push(false, &data, max_output_bytes) {
-                    output_limit = true;
-                    if let Some(reply) = reply.take() {
-                        let _ = reply.send(ExecReply::Accepted);
+                match output.push(false, &data, max_output_bytes) {
+                    PartialExecPush::Accepted => {}
+                    PartialExecPush::OutputLimit => {
+                        output_limit = true;
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(ExecReply::Accepted);
+                        }
+                        break;
                     }
-                    break;
+                    PartialExecPush::ResourceLimit => {
+                        resource_limit = true;
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(ExecReply::Accepted);
+                        }
+                        break;
+                    }
                 }
             }
             ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
                 output.remote_execution = RemoteExecution::MayHaveStarted;
-                if !output.push(true, &data, max_output_bytes) {
-                    output_limit = true;
-                    if let Some(reply) = reply.take() {
-                        let _ = reply.send(ExecReply::Accepted);
+                match output.push(true, &data, max_output_bytes) {
+                    PartialExecPush::Accepted => {}
+                    PartialExecPush::OutputLimit => {
+                        output_limit = true;
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(ExecReply::Accepted);
+                        }
+                        break;
                     }
-                    break;
+                    PartialExecPush::ResourceLimit => {
+                        resource_limit = true;
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(ExecReply::Accepted);
+                        }
+                        break;
+                    }
                 }
             }
             ChannelMsg::ExitStatus { exit_status } => {
@@ -1007,6 +1088,7 @@ async fn read_exec_output(
         output,
         clean_close,
         output_limit,
+        resource_limit,
     }
 }
 
@@ -1036,13 +1118,15 @@ async fn wait_for_exec_stop(
 
 async fn finish_exec_reader(
     reader: &mut tokio::task::JoinHandle<ReadTaskResult>,
+    output_budget: OutputBudget,
 ) -> ReadTaskResult {
     match tokio::time::timeout(Duration::from_millis(500), reader).await {
         Ok(Ok(output)) => output,
         _ => ReadTaskResult {
-            output: PartialExec::sent(),
+            output: PartialExec::sent(output_budget),
             clean_close: false,
             output_limit: false,
+            resource_limit: false,
         },
     }
 }
@@ -1084,6 +1168,7 @@ fn exec_stop_error(stop: ExecStop, output: PartialExec) -> ExecError {
             output,
             clean_close: false,
             output_limit: false,
+            resource_limit: false,
         },
     )
 }
@@ -1094,14 +1179,15 @@ fn exec_error_from_reader(
     message: impl Into<String>,
     result: ReadTaskResult,
 ) -> ExecError {
+    let (stdout, stderr, exit_status, remote_execution) = result.output.into_parts();
     ExecError {
         code,
         phase,
         message: message.into(),
-        remote_execution: result.output.remote_execution(),
-        stdout: result.output.stdout,
-        stderr: result.output.stderr,
-        exit_status: result.output.exit_status,
+        remote_execution,
+        stdout,
+        stderr,
+        exit_status,
     }
 }
 
@@ -1378,6 +1464,29 @@ mod tests {
 
     const USERNAME: &str = "test-user";
     const PASSWORD: &str = "correct horse battery staple";
+
+    #[test]
+    fn exec_output_budget_is_shared_and_released_on_drop() {
+        let budget = OutputBudget::with_limit(4);
+        let mut first = PartialExec::new(budget.clone());
+        let mut second = PartialExec::new(budget.clone());
+
+        assert!(matches!(
+            first.push(false, &[1; 3], 8),
+            PartialExecPush::Accepted
+        ));
+        assert!(matches!(
+            second.push(true, &[2; 2], 8),
+            PartialExecPush::ResourceLimit
+        ));
+
+        drop(first);
+        let mut third = PartialExec::new(budget);
+        assert!(matches!(
+            third.push(false, &[3; 4], 8),
+            PartialExecPush::Accepted
+        ));
+    }
 
     struct TestServer {
         attempts: Arc<AtomicUsize>,

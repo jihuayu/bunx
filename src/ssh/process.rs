@@ -48,7 +48,7 @@ impl OutputBudget {
         true
     }
 
-    fn release(&self, bytes: usize) {
+    pub(crate) fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
