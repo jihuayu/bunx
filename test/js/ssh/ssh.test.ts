@@ -1329,6 +1329,46 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     5_000,
   );
 
+  test(
+    "connections bound aggregate buffered spawn output",
+    async () => {
+      const ssh = await connectedClient();
+      try {
+        const bytesPerProcess = 8 * 1024 * 1024;
+        const processes = await Promise.all(
+          Array.from({ length: 5 }, () =>
+            ssh.spawn(`head -c ${bytesPerProcess} /dev/zero`, {
+              stderr: "ignore",
+              timeoutMs: 15_000,
+            }),
+          ),
+        );
+
+        await Promise.all(processes.map(process => process.closed));
+        const results = await Promise.all(
+          processes.map(async process => {
+            try {
+              return { bytes: (await readAll(process.stdout)).byteLength };
+            } catch (error) {
+              return { error };
+            }
+          }),
+        );
+        const limitErrors = results.filter(
+          result =>
+            "error" in result &&
+            result.error instanceof SSHError &&
+            result.error.code === "ERR_SSH_RESOURCE_LIMIT" &&
+            result.error.phase === "io",
+        );
+        expect(limitErrors.length).toBeGreaterThan(0);
+      } finally {
+        await ssh.close();
+      }
+    },
+    15_000,
+  );
+
   test("spawn may observe exit before buffered output is consumed", async () => {
     const ssh = await connectedClient();
     try {

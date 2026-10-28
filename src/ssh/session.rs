@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::config::{Auth, Config, TransportConfig};
 use crate::host_key::{HostKeyError, fingerprint, sign_algorithm_name, verifier};
-use crate::process::{BlockingProcess, ProcessConfig, start_driver};
+use crate::process::{BlockingProcess, OutputBudget, ProcessConfig, start_driver};
 
 const MAX_INITIAL_CHANNEL_MESSAGES: usize = 256;
 const MAX_INITIAL_CHANNEL_BYTES: usize = 256 * 1024;
@@ -378,6 +378,7 @@ struct SessionInner {
     /// must outlive the driver task the handle joins on.
     handle: Mutex<Option<Handle<ClientHandler>>>,
     info: ConnectionInfo,
+    output_budget: OutputBudget,
     /// Keeps the russh driver task's Tokio reactor alive for the session.
     _runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -920,7 +921,14 @@ impl Session {
             }
         }
 
-        let process = start_driver(channel, runtime, config, cancel, initial_messages);
+        let process = start_driver(
+            channel,
+            runtime,
+            config,
+            self.inner.output_budget.clone(),
+            cancel,
+            initial_messages,
+        );
         Ok(process)
     }
 }
@@ -1217,6 +1225,7 @@ async fn connect_inner(
         inner: Arc::new(SessionInner {
             handle: Mutex::new(Some(handle)),
             info,
+            output_budget: OutputBudget::default(),
             _runtime: runtime,
         }),
     })
