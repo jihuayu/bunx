@@ -1017,10 +1017,7 @@ class SSHProcess {
     } catch {
       closedPromise = Promise.resolve();
     }
-    this.#closed = Promise.resolve(closedPromise).then(
-      () => {},
-      () => {},
-    );
+    this.#closed = Promise.allSettled([Promise.resolve(closedPromise), this.#exited]).then(() => {});
     this.#closed.then(() => {
       this.#finish();
     });

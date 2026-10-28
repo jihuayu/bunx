@@ -1326,6 +1326,17 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("awaiting closed also settles the visible exit status", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("exit 7");
+      await proc.closed;
+      expect(proc.exitCode).toBe(7);
+    } finally {
+      await ssh.close();
+    }
+  });
+
   test("spawn cancellation is idempotent and leaves the parent connection usable", async () => {
     const ssh = await connectedClient();
     try {
