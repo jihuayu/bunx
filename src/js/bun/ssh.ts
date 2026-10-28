@@ -1225,7 +1225,7 @@ class SSH {
     }
 
     const startedAt = performance.now();
-    let phase = "handshake";
+    let phase = execOptions.signal?.aborted ? "exec" : "handshake";
     const operation = createOperation(execOptions.signal, execOptions.timeoutMs, () => phase);
     return this.#exec(commandBytes, execOptions, operation, startedAt, value => {
       phase = value;
@@ -1243,7 +1243,7 @@ class SSH {
     }
 
     const startedAt = performance.now();
-    let phase = "handshake";
+    let phase = spawnOptions.signal?.aborted ? "exec" : "handshake";
     const operation = createOperation(spawnOptions.signal, spawnOptions.timeoutMs, () => phase);
     return this.#spawn(commandBytes, spawnOptions, operation, startedAt, value => {
       phase = value;
@@ -1417,6 +1417,17 @@ class SSH {
       const nativeOperation = native.execute(command, stdin, remainingTimeout, options.maxOutputBytes);
       const nativePromise = nativeOperation.promise;
       operationId = String(nativeOperation.id);
+      const releaseChannel = release;
+      let channelReleased = false;
+      release = null;
+      const releaseAfterNativeCleanup = () => {
+        if (channelReleased) {
+          return;
+        }
+        channelReleased = true;
+        releaseChannel();
+      };
+      Promise.resolve(nativePromise).then(releaseAfterNativeCleanup, releaseAfterNativeCleanup);
       const resultPromise = new Promise((resolve, reject) => {
         function onAbort() {
           native.cancelOperation(nativeOperation.id);

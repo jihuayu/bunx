@@ -44,6 +44,21 @@ async function readAll(stream: ReadableStream<Uint8Array> | null): Promise<Uint8
   return output;
 }
 
+function patternedBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = i & 0xff;
+  }
+  return bytes;
+}
+
+function expectBytes(actual: Uint8Array, expected: Uint8Array): void {
+  expect(actual.byteLength).toBe(expected.byteLength);
+  expect(new Bun.CryptoHasher("sha256").update(actual).digest("hex")).toBe(
+    new Bun.CryptoHasher("sha256").update(expected).digest("hex"),
+  );
+}
+
 function expectConfigError(fn: () => unknown): SSHError {
   let thrown: unknown;
   try {
@@ -826,6 +841,96 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("exec drains large stdout and stderr concurrently", async () => {
+    const ssh = await connectedClient();
+    try {
+      const bytesPerStream = 2 * 1024 * 1024 + 4096;
+      const result = await ssh.exec(
+        `head -c ${bytesPerStream} /dev/zero & head -c ${bytesPerStream} /dev/zero >&2 & wait`,
+        { maxOutputBytes: bytesPerStream * 2 },
+      );
+      expect(result.stdout.byteLength).toBe(bytesPerStream);
+      expect(result.stderr.byteLength).toBe(bytesPerStream);
+      expect(result.stdout.every(byte => byte === 0)).toBe(true);
+      expect(result.stderr.every(byte => byte === 0)).toBe(true);
+      expect(result.status).toEqual({ type: "exit", code: 0 });
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec writes stdin larger than a channel window", async () => {
+    const ssh = await connectedClient();
+    try {
+      const input = patternedBytes(2 * 1024 * 1024 + 4096);
+      const result = await ssh.exec("cat", { stdin: input, maxOutputBytes: input.byteLength });
+      expectBytes(result.stdout, input);
+      expect(result.stderr.byteLength).toBe(0);
+      expect(result.status).toEqual({ type: "exit", code: 0 });
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("exec rejects a locked or failing stdin stream without poisoning the connection", async () => {
+    const ssh = await connectedClient();
+    try {
+      const locked = new ReadableStream<Uint8Array>();
+      const reader = locked.getReader();
+      await expect(ssh.exec("cat", { stdin: locked })).rejects.toMatchObject({
+        code: "ERR_SSH_IO",
+        phase: "exec",
+      });
+      reader.releaseLock();
+
+      const failing = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.error(new Error("stdin failed"));
+        },
+      });
+      await expect(ssh.exec("cat", { stdin: failing })).rejects.toMatchObject({
+        code: "ERR_SSH_IO",
+        phase: "exec",
+      });
+
+      expect((await ssh.exec("printf still-ready")).text()).toBe("still-ready");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("an already aborted exec does not read stdin or reach the remote command", async () => {
+    const ssh = await connectedClient();
+    try {
+      const marker = join(dir, "aborted-exec-marker");
+      let reads = 0;
+      const input = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads++;
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const controller = new AbortController();
+      controller.abort();
+      const error = await ssh
+        .exec(`touch ${JSON.stringify(marker)}`, { signal: controller.signal, stdin: input })
+        .catch(error => error);
+      expect(error).toBeInstanceOf(SSHError);
+      expect(error.code).toBe("ERR_SSH_ABORTED");
+      expect(error.phase).toBe("exec");
+      expect(reads).toBe(0);
+      expect(await Bun.file(marker).exists()).toBe(false);
+      expect(ssh.state).toBe("ready");
+    } finally {
+      await ssh.close();
+    }
+  });
+
   test("exec cancellation bounds one channel without poisoning the connection", async () => {
     const ssh = await connectedClient();
     try {
@@ -913,6 +1018,66 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("spawn drains large stdout and stderr concurrently", async () => {
+    const ssh = await connectedClient();
+    try {
+      const bytesPerStream = 2 * 1024 * 1024 + 4096;
+      const proc = await ssh.spawn(
+        `head -c ${bytesPerStream} /dev/zero & head -c ${bytesPerStream} /dev/zero >&2 & wait`,
+      );
+      const [stdout, stderr, status] = await Promise.all([readAll(proc.stdout), readAll(proc.stderr), proc.exited]);
+      expect(stdout.byteLength).toBe(bytesPerStream);
+      expect(stderr.byteLength).toBe(bytesPerStream);
+      expect(stdout.every(byte => byte === 0)).toBe(true);
+      expect(stderr.every(byte => byte === 0)).toBe(true);
+      expect(status).toEqual({ type: "exit", code: 0 });
+      await proc.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn writes stdin larger than a channel window through a pipe", async () => {
+    const ssh = await connectedClient();
+    try {
+      const input = patternedBytes(2 * 1024 * 1024 + 4096);
+      const proc = await ssh.spawn("cat", { stdin: "pipe" });
+      const output = readAll(proc.stdout);
+      const writer = proc.stdin!.getWriter();
+      await writer.write(input);
+      await writer.close();
+      expectBytes(await output, input);
+      expect(await proc.exited).toEqual({ type: "exit", code: 0 });
+      await proc.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn accepts Blob and byte streams as initial stdin", async () => {
+    const ssh = await connectedClient();
+    try {
+      const input = patternedBytes(512 * 1024);
+      for (const data of [
+        new Blob([input]),
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(input.subarray(0, 128 * 1024));
+            controller.enqueue(input.subarray(128 * 1024));
+            controller.close();
+          },
+        }),
+      ]) {
+        const proc = await ssh.spawn("cat", { stdin: { data } });
+        expectBytes(await readAll(proc.stdout), input);
+        expect(await proc.exited).toEqual({ type: "exit", code: 0 });
+        await proc.closed;
+      }
+    } finally {
+      await ssh.close();
+    }
+  });
+
   test("spawn ignores each output branch while continuing to drain the channel", async () => {
     const ssh = await connectedClient();
     try {
@@ -990,6 +1155,18 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("spawn accepts a best-effort signal while the process is running", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("cat", { stdin: "pipe", stdout: "ignore", stderr: "ignore" });
+      await proc.sendSignal("TERM");
+      await proc.cancel();
+      await proc.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
   test("cancelling one output reader discards only that branch", async () => {
     const ssh = await connectedClient();
     try {
@@ -1028,6 +1205,42 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     });
     expect(ssh.state).toBe("closed");
     expect(await ssh.closed).toEqual({ reason: "local", forced: true });
+  });
+
+  test("a later close call cannot extend the first grace deadline", async () => {
+    const ssh = await connectedClient();
+    const proc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+    const first = ssh.close({ gracePeriodMs: 200 });
+    const second = ssh.close({ gracePeriodMs: 5_000 });
+    expect(second).toBe(first);
+
+    const started = performance.now();
+    expect(await first).toEqual({ forced: true });
+    expect(performance.now() - started).toBeLessThan(1_500);
+    expect(await second).toEqual({ forced: true });
+    await proc.closed;
+    await expect(proc.exited).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+      phase: "exec",
+    });
+  });
+
+  test("a later force close shortens an earlier grace deadline", async () => {
+    const ssh = await connectedClient();
+    const proc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+    const first = ssh.close({ gracePeriodMs: 5_000 });
+    const second = ssh.close({ force: true });
+    expect(second).toBe(first);
+
+    const started = performance.now();
+    expect(await first).toEqual({ forced: true });
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(await second).toEqual({ forced: true });
+    await proc.closed;
+    await expect(proc.exited).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+      phase: "exec",
+    });
   });
 
   test("spawned channels obey channel and pending-operation limits", async () => {

@@ -499,6 +499,7 @@ impl Session {
         let Some(mut handle) = slot.take() else {
             return Ok(CloseResult { forced: false });
         };
+        let started = tokio::time::Instant::now();
 
         match tokio::time::timeout(
             grace_period,
@@ -515,7 +516,8 @@ impl Session {
             Err(_) => return Ok(CloseResult { forced: true }),
         }
 
-        match tokio::time::timeout(grace_period, &mut handle).await {
+        let remaining = grace_period.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, &mut handle).await {
             Ok(Ok(())) => Ok(CloseResult { forced: false }),
             Ok(Err(_)) => {
                 // The transport is gone, which is the postcondition of close.
