@@ -1096,8 +1096,11 @@ describe("@types/bun integration test", () => {
             type SSHHostKeyPolicy,
             type SSHInput,
             type SSHOptions,
+            type SSHProcess,
             type SSHResult,
             type SSHSecret,
+            type SSHSignal,
+            type SpawnOptions,
             type OperationOptions,
             type SecretSource,
           } from "bun";
@@ -1152,6 +1155,13 @@ describe("@types/bun integration test", () => {
             maxOutputBytes: 8 * 1024 * 1024,
           };
           const execution: Promise<SSHResult> = ssh.exec("uname -a", execOptions);
+          const spawnOptions: SpawnOptions = {
+            ...operationOptions,
+            stdin: "pipe",
+            stdout: "pipe",
+            stderr: "ignore",
+          };
+          const spawned: Promise<SSHProcess> = ssh.spawn("cat", spawnOptions);
 
           declare const result: SSHResult;
           const status: ExitStatus = result.status;
@@ -1161,6 +1171,19 @@ describe("@types/bun integration test", () => {
           const decoded: string = result.text();
           const parsed: unknown = result.json();
           const resultRemoteExecution: RemoteExecution = result.remoteExecution;
+          declare const process: SSHProcess;
+          const processStdin: WritableStream<Uint8Array<ArrayBufferLike>> | null = process.stdin;
+          const processStdout: ReadableStream<Uint8Array<ArrayBufferLike>> | null = process.stdout;
+          const processStderr: ReadableStream<Uint8Array<ArrayBufferLike>> | null = process.stderr;
+          const processExited: Promise<ExitStatus> = process.exited;
+          const processClosed: Promise<void> = process.closed;
+          const processExitCode: number | null = process.exitCode;
+          const processRemoteExecution: RemoteExecution = process.remoteExecution;
+          const terminateSignal: SSHSignal = "TERM";
+          const signalling: Promise<void> = process.sendSignal(terminateSignal);
+          const cancelling: Promise<void> = process.cancel();
+          const processDisposing: Promise<void> = process[Symbol.asyncDispose]();
+          const processWithAsyncDispose: AsyncDisposable = process;
           const closing: Promise<SSHCloseResult> = ssh.close(closeOptions);
           const disposing: Promise<void> = ssh[Symbol.asyncDispose]();
 
@@ -1200,6 +1223,18 @@ describe("@types/bun integration test", () => {
 
           // @ts-expect-error - unknown exec fields are rejected
           ssh.exec("true", { cwd: "/tmp" });
+
+          // @ts-expect-error - spawn output modes are pipe or ignore
+          ssh.spawn("true", { stdout: "buffer" });
+
+          // @ts-expect-error - data stdin must use the wrapper object
+          ssh.spawn("cat", { stdin: new Uint8Array() });
+
+          // @ts-expect-error - signal names are a fixed POSIX subset
+          ssh.spawn("sleep 1").then(process => process.sendSignal("SIGTERM"));
+
+          // @ts-expect-error - unknown spawn fields are rejected
+          ssh.spawn("true", { cwd: "/tmp" });
         `,
       },
       emptyInterfaces: expectedEmptyInterfacesWhenNoDOM,

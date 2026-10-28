@@ -15,6 +15,35 @@ function validOptions() {
   };
 }
 
+async function readAll(stream: ReadableStream<Uint8Array> | null): Promise<Uint8Array> {
+  if (stream === null) {
+    return new Uint8Array();
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
 function expectConfigError(fn: () => unknown): SSHError {
   let thrown: unknown;
   try {
@@ -331,6 +360,34 @@ describe("Bun.SSH constructor", () => {
     const controller = new AbortController();
     controller.abort();
     await expect(ssh.exec("true", { signal: controller.signal })).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+    });
+    expect(ssh.state).toBe("idle");
+  });
+
+  test("validates spawn arguments without doing I/O", async () => {
+    const ssh = new SSH(validOptions());
+    await expect(ssh.spawn("")).rejects.toMatchObject({ code: "ERR_SSH_CONFIG", phase: "config" });
+    await expect(ssh.spawn("true", { stdin: { data: 42 } })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.spawn("true", { stdin: { unknown: true } })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.spawn("true", { stdout: "text" })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.spawn("true", { stderr: "text" })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(ssh.spawn("true", { signal: controller.signal })).rejects.toMatchObject({
       code: "ERR_SSH_ABORTED",
     });
     expect(ssh.state).toBe("idle");
@@ -801,6 +858,201 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
 
       const result = await ssh.exec("printf 'after-timeout'");
       expect(result.text()).toBe("after-timeout");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn exposes independent stdout and stderr streams with an explicit exit status", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("printf stdout; printf stderr >&2; exit 7");
+      expect(proc.stdin).toBeNull();
+      expect(proc.stdout).not.toBeNull();
+      expect(proc.stderr).not.toBeNull();
+
+      const [stdout, stderr, status] = await Promise.all([readAll(proc.stdout), readAll(proc.stderr), proc.exited]);
+      expect(new TextDecoder().decode(stdout)).toBe("stdout");
+      expect(new TextDecoder().decode(stderr)).toBe("stderr");
+      expect(status).toEqual({ type: "exit", code: 7 });
+      await proc.closed;
+      expect(proc.exitCode).toBe(7);
+      expect(proc.remoteExecution).toBe("exit-observed");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn supports pipe stdin, data wrappers, and ignored stdin", async () => {
+    const ssh = await connectedClient();
+    try {
+      const piped = await ssh.spawn("cat", { stdin: "pipe" });
+      const input = new Uint8Array([0, 1, 2, 127, 128, 255]);
+      await expect(piped.sendSignal("SIGTERM" as Bun.SSHSignal)).rejects.toMatchObject({
+        code: "ERR_SSH_CONFIG",
+        phase: "config",
+      });
+      const writer = piped.stdin!.getWriter();
+      await writer.write(input);
+      await writer.close();
+      expect(await readAll(piped.stdout)).toEqual(input);
+      expect(await piped.exited).toEqual({ type: "exit", code: 0 });
+      await piped.closed;
+
+      const wrapped = await ssh.spawn("cat", { stdin: { data: "pipe" } });
+      expect(new TextDecoder().decode(await readAll(wrapped.stdout))).toBe("pipe");
+      expect(await wrapped.exited).toEqual({ type: "exit", code: 0 });
+      await wrapped.closed;
+
+      const ignored = await ssh.spawn("cat", { stdin: "ignore" });
+      expect((await readAll(ignored.stdout)).byteLength).toBe(0);
+      expect(await ignored.exited).toEqual({ type: "exit", code: 0 });
+      await ignored.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn ignores each output branch while continuing to drain the channel", async () => {
+    const ssh = await connectedClient();
+    try {
+      const stdoutIgnored = await ssh.spawn("head -c 400000 /dev/zero; printf stderr >&2", {
+        stdout: "ignore",
+      });
+      expect(stdoutIgnored.stdout).toBeNull();
+      expect(new TextDecoder().decode(await readAll(stdoutIgnored.stderr))).toBe("stderr");
+      expect(await stdoutIgnored.exited).toEqual({ type: "exit", code: 0 });
+      await stdoutIgnored.closed;
+
+      const stderrIgnored = await ssh.spawn("printf stdout; head -c 400000 /dev/zero >&2", {
+        stderr: "ignore",
+      });
+      expect(stderrIgnored.stderr).toBeNull();
+      expect(new TextDecoder().decode(await readAll(stderrIgnored.stdout))).toBe("stdout");
+      expect(await stderrIgnored.exited).toEqual({ type: "exit", code: 0 });
+      await stderrIgnored.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn may observe exit before buffered output is consumed", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("printf tail; exit 3");
+      expect(await proc.exited).toEqual({ type: "exit", code: 3 });
+      expect(new TextDecoder().decode(await readAll(proc.stdout))).toBe("tail");
+      await proc.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn cancellation is idempotent and leaves the parent connection usable", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+      const first = proc.cancel();
+      const second = proc.cancel();
+      expect(first).toBe(second);
+      await first;
+      await proc.closed;
+      await expect(proc.exited).rejects.toMatchObject({
+        code: "ERR_SSH_ABORTED",
+        phase: "exec",
+      });
+
+      const result = await ssh.exec("printf still-ready");
+      expect(result.text()).toBe("still-ready");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("spawn timeout remains active after spawn resolves", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("sleep 30", {
+        stdout: "ignore",
+        stderr: "ignore",
+        timeoutMs: 100,
+      });
+      await expect(proc.exited).rejects.toMatchObject({
+        code: "ERR_SSH_TIMEOUT",
+        phase: "exec",
+      });
+      await proc.closed;
+
+      const result = await ssh.exec("printf after-timeout");
+      expect(result.text()).toBe("after-timeout");
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("cancelling one output reader discards only that branch", async () => {
+    const ssh = await connectedClient();
+    try {
+      const proc = await ssh.spawn("head -c 1048576 /dev/zero | tr '\\0' x; printf stderr >&2");
+      await proc.stdout!.cancel();
+      expect(new TextDecoder().decode(await readAll(proc.stderr))).toBe("stderr");
+      expect(await proc.exited).toEqual({ type: "exit", code: 0 });
+      await proc.closed;
+    } finally {
+      await ssh.close();
+    }
+  });
+
+  test("close waits for active spawned channels within its grace period", async () => {
+    const ssh = await connectedClient();
+    const proc = await ssh.spawn("sleep 0.2; printf finished");
+    const closing = ssh.close({ gracePeriodMs: 2_000 });
+    expect(ssh.state).toBe("closing");
+    expect(new TextDecoder().decode(await readAll(proc.stdout))).toBe("finished");
+    expect(await proc.exited).toEqual({ type: "exit", code: 0 });
+    expect(await closing).toEqual({ forced: false });
+    await proc.closed;
+    expect(ssh.state).toBe("closed");
+  });
+
+  test("force close stops waiting for active spawned channels", async () => {
+    const ssh = await connectedClient();
+    const proc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+    const started = performance.now();
+    expect(await ssh.close({ force: true })).toEqual({ forced: true });
+    expect(performance.now() - started).toBeLessThan(1_000);
+    await proc.closed;
+    await expect(proc.exited).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+      phase: "exec",
+    });
+    expect(ssh.state).toBe("closed");
+    expect(await ssh.closed).toEqual({ reason: "local", forced: true });
+  });
+
+  test("spawned channels obey channel and pending-operation limits", async () => {
+    const ssh = await connectedClient({
+      maxChannels: 1,
+      maxPendingOperations: 1,
+      queueTimeoutMs: 75,
+    });
+    try {
+      const proc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+      const queued = ssh.exec("printf queued");
+      await expect(ssh.exec("printf rejected")).rejects.toMatchObject({
+        code: "ERR_SSH_QUEUE_FULL",
+        phase: "queue",
+      });
+
+      await proc.cancel();
+      expect((await queued).text()).toBe("queued");
+
+      const timeoutProc = await ssh.spawn("sleep 30", { stdout: "ignore", stderr: "ignore" });
+      await expect(ssh.exec("true")).rejects.toMatchObject({
+        code: "ERR_SSH_QUEUE_TIMEOUT",
+        phase: "queue",
+      });
+      await timeoutProc.cancel();
     } finally {
       await ssh.close();
     }

@@ -1,9 +1,10 @@
 use bun_jsc::bindgen::{self, JsHeap, JsScope};
 use bun_jsc::{JSGlobalObject, JSPromiseStrong, JSValue, Job, JobContext, JsAffine, JsResult};
 use bun_ssh::{
-    Auth, AuthError, BlockingSession, CloseError, CloseResult, ConnectError, ConnectionInfo,
-    ExecCancelReceiver, ExecCancelSender, ExecError, ExecResult, ExitStatus, HostKeyPolicy,
-    RemoteExecution, Secret, TransportConfig, exec_cancellation,
+    Auth, AuthError, BlockingProcess, BlockingSession, CloseError, CloseResult, ConnectError,
+    ConnectionInfo, ExecCancelReceiver, ExecCancelSender, ExecError, ExecResult, ExitStatus,
+    HostKeyPolicy, ProcessConfig, ProcessError, ProcessExit, ProcessStdin, RemoteExecution, Secret,
+    TransportConfig, exec_cancellation,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -237,6 +238,28 @@ impl SSHConnection {
         )
     }
 
+    fn start_process(
+        &self,
+        command: Vec<u8>,
+        config: ProcessConfig,
+        timeout_ms: u64,
+        cancel: ExecCancelReceiver,
+    ) -> Result<BlockingProcess, ExecError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ExecError::channel_closed("SSH session is not connected".to_string()))?;
+        session.start_process(
+            command,
+            config,
+            (timeout_ms != 0).then(|| std::time::Duration::from_millis(timeout_ms)),
+            cancel,
+        )
+    }
+
     pub(crate) fn execute<'a>(
         &self,
         cx: &mut JsScope<'a>,
@@ -259,6 +282,60 @@ impl SSHConnection {
                 stdin,
                 timeout_ms,
                 max_output_bytes,
+                cancel,
+                result: None,
+            },
+            promise,
+        );
+
+        let object = JSValue::create_empty_object(cx.global(), 2);
+        object.put(
+            cx.global(),
+            b"id",
+            JSValue::js_number_from_uint64(operation_id),
+        );
+        object.put(cx.global(), b"promise", value);
+        Ok(object)
+    }
+
+    pub(crate) fn start_process_js<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        command: Vec<u8>,
+        stdin_mode: &[u8],
+        stdin_data: Vec<u8>,
+        capture_stdout: bool,
+        capture_stderr: bool,
+        timeout_ms: u64,
+    ) -> bindgen::Result<'a, JSValue> {
+        let stdin = match stdin_mode {
+            b"ignore" => ProcessStdin::Ignore,
+            b"pipe" => ProcessStdin::Pipe,
+            b"data" => ProcessStdin::Data(stdin_data),
+            _ => {
+                return Err(cx
+                    .heap
+                    .type_error(format_args!("unsupported SSH stdin mode")));
+            }
+        };
+        let config = ProcessConfig {
+            stdin,
+            capture_stdout,
+            capture_stderr,
+        };
+        let (operation_id, cancel) = self.begin_operation();
+        let promise = JSPromiseStrong::init(cx.global());
+        let value = promise.value();
+        Job::<StartProcessJob>::schedule(
+            &cx.js_thread(),
+            StartProcessJob {
+                connection: unsafe {
+                    bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut())
+                },
+                operation_id,
+                command,
+                config,
+                timeout_ms,
                 cancel,
                 result: None,
             },
@@ -366,6 +443,222 @@ impl SSHConnection {
     }
 }
 
+#[derive(bun_ptr::ThreadSafeRefCounted)]
+pub(crate) struct SSHSpawnProcess {
+    process: BlockingProcess,
+    connection: bun_ptr::RefPtr<SSHConnection>,
+    operation_id: u64,
+    ref_count: bun_ptr::ThreadSafeRefCount<SSHSpawnProcess>,
+}
+
+impl SSHSpawnProcess {
+    fn new(
+        process: BlockingProcess,
+        connection: bun_ptr::RefPtr<SSHConnection>,
+        operation_id: u64,
+    ) -> Self {
+        Self {
+            process,
+            connection,
+            operation_id,
+            ref_count: bun_ptr::ThreadSafeRefCount::init(),
+        }
+    }
+
+    pub(crate) fn finalize(&self) {
+        self.connection.finish_operation(self.operation_id);
+    }
+
+    fn finish_operation(&self) {
+        self.connection.finish_operation(self.operation_id);
+    }
+
+    fn schedule<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        operation: ProcessOperation,
+    ) -> bindgen::Result<'a, JSValue> {
+        let promise = JSPromiseStrong::init(cx.global());
+        let value = promise.value();
+        Job::<ProcessJob>::schedule(
+            &cx.js_thread(),
+            ProcessJob {
+                process: unsafe { bun_ptr::RefPtr::init_ref(std::ptr::from_ref(self).cast_mut()) },
+                operation,
+                result: None,
+            },
+            promise,
+        );
+        Ok(value)
+    }
+
+    pub(crate) fn read_stdout<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        max_bytes: usize,
+    ) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::ReadStdout(max_bytes))
+    }
+
+    pub(crate) fn read_stderr<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        max_bytes: usize,
+    ) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::ReadStderr(max_bytes))
+    }
+
+    pub(crate) fn discard_stdout<'a>(&self, cx: &mut JsScope<'a>) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::DiscardStdout)
+    }
+
+    pub(crate) fn discard_stderr<'a>(&self, cx: &mut JsScope<'a>) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::DiscardStderr)
+    }
+
+    pub(crate) fn write_stdin<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        data: Vec<u8>,
+    ) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::WriteStdin(data))
+    }
+
+    pub(crate) fn close_stdin<'a>(&self, cx: &mut JsScope<'a>) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::CloseStdin)
+    }
+
+    pub(crate) fn send_signal<'a>(
+        &self,
+        cx: &mut JsScope<'a>,
+        signal: &[u8],
+    ) -> bindgen::Result<'a, JSValue> {
+        let signal = std::str::from_utf8(signal)
+            .map_err(|_| {
+                cx.heap
+                    .type_error(format_args!("SSH signal must be valid UTF-8"))
+            })?
+            .to_string();
+        self.schedule(cx, ProcessOperation::SendSignal(signal))
+    }
+
+    pub(crate) fn cancel(&self, _cx: &mut JsScope<'_>) -> bool {
+        self.process.cancel()
+    }
+
+    pub(crate) fn wait_exit<'a>(&self, cx: &mut JsScope<'a>) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::WaitExit)
+    }
+
+    pub(crate) fn wait_closed<'a>(&self, cx: &mut JsScope<'a>) -> bindgen::Result<'a, JSValue> {
+        self.schedule(cx, ProcessOperation::WaitClosed)
+    }
+
+    pub(crate) fn get_remote_execution(&self) -> &[u8] {
+        remote_execution_name(self.process.remote_execution())
+    }
+}
+
+enum ProcessOperation {
+    ReadStdout(usize),
+    ReadStderr(usize),
+    DiscardStdout,
+    DiscardStderr,
+    WriteStdin(Vec<u8>),
+    CloseStdin,
+    SendSignal(String),
+    WaitExit,
+    WaitClosed,
+}
+
+enum ProcessResult {
+    Bytes(Option<Vec<u8>>),
+    Exit(ProcessExit),
+    Unit,
+}
+
+struct ProcessJob {
+    process: bun_ptr::RefPtr<SSHSpawnProcess>,
+    operation: ProcessOperation,
+    result: Option<Result<ProcessResult, ProcessError>>,
+}
+
+// SAFETY: the process handle owns only thread-safe channel state, and its ref
+// keeps that state alive while the job runs.
+unsafe impl Send for ProcessJob {}
+
+impl JobContext for ProcessJob {
+    type OffThread = Self;
+    type Js = JSPromiseStrong;
+
+    fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
+        let process = &this.process.process;
+        this.result = Some(match &this.operation {
+            ProcessOperation::ReadStdout(max_bytes) => {
+                process.read_stdout(*max_bytes).map(ProcessResult::Bytes)
+            }
+            ProcessOperation::ReadStderr(max_bytes) => {
+                process.read_stderr(*max_bytes).map(ProcessResult::Bytes)
+            }
+            ProcessOperation::DiscardStdout => {
+                process.discard_stdout();
+                Ok(ProcessResult::Unit)
+            }
+            ProcessOperation::DiscardStderr => {
+                process.discard_stderr();
+                Ok(ProcessResult::Unit)
+            }
+            ProcessOperation::WriteStdin(data) => process
+                .write_stdin(data.clone())
+                .map(|()| ProcessResult::Unit),
+            ProcessOperation::CloseStdin => process.close_stdin().map(|()| ProcessResult::Unit),
+            ProcessOperation::SendSignal(signal) => {
+                process.send_signal(signal).map(|()| ProcessResult::Unit)
+            }
+            ProcessOperation::WaitExit => process.wait_exit().map(ProcessResult::Exit),
+            ProcessOperation::WaitClosed => {
+                process.wait_closed();
+                Ok(ProcessResult::Unit)
+            }
+        });
+        Some(done)
+    }
+
+    fn then(
+        mut this: Self,
+        mut promise: JSPromiseStrong,
+        cx: &bun_jsc::JsThread<'_>,
+    ) -> JsResult<()> {
+        let global = cx.global();
+        if matches!(this.operation, ProcessOperation::WaitClosed) {
+            this.process.finish_operation();
+        }
+        match this.result.take().expect("process result") {
+            Ok(ProcessResult::Bytes(Some(bytes))) => promise.resolve(
+                global,
+                JSValue::create_buffer_from_box(global, bytes.into_boxed_slice())?,
+            ),
+            Ok(ProcessResult::Bytes(None) | ProcessResult::Unit) => {
+                promise.resolve(global, JSValue::UNDEFINED)
+            }
+            Ok(ProcessResult::Exit(exit)) => {
+                let value = JSValue::create_empty_object(global, 2);
+                value.put(global, b"status", exit_status_to_js(global, &exit.status)?);
+                value.put(
+                    global,
+                    b"remoteExecution",
+                    remote_execution_to_js(global, exit.remote_execution)?,
+                );
+                promise.resolve(global, value)
+            }
+            Err(error) => {
+                let error = process_error_to_js(global, error)?;
+                promise.reject_with_async_stack(global, Ok(error))
+            }
+        }
+    }
+}
+
 struct ConnectJob {
     connection: bun_ptr::RefPtr<SSHConnection>,
     config: TransportConfig,
@@ -381,6 +674,59 @@ struct ExecJob {
     max_output_bytes: u64,
     cancel: ExecCancelReceiver,
     result: Option<Result<ExecResult, ExecError>>,
+}
+
+struct StartProcessJob {
+    connection: bun_ptr::RefPtr<SSHConnection>,
+    operation_id: u64,
+    command: Vec<u8>,
+    config: ProcessConfig,
+    timeout_ms: u64,
+    cancel: ExecCancelReceiver,
+    result: Option<Result<BlockingProcess, ExecError>>,
+}
+
+// SAFETY: every field is owned or thread-safe. The connection ref keeps the
+// transport alive while the channel is opened and exec is acknowledged.
+unsafe impl Send for StartProcessJob {}
+
+impl JobContext for StartProcessJob {
+    type OffThread = Self;
+    type Js = JSPromiseStrong;
+
+    fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
+        this.result = Some(this.connection.start_process(
+            std::mem::take(&mut this.command),
+            this.config.clone(),
+            this.timeout_ms,
+            this.cancel.clone(),
+        ));
+        Some(done)
+    }
+
+    fn then(
+        mut this: Self,
+        mut promise: JSPromiseStrong,
+        cx: &bun_jsc::JsThread<'_>,
+    ) -> JsResult<()> {
+        let global = cx.global();
+        match this.result.take().expect("start process result") {
+            Ok(process) => {
+                let ptr = bun_core::heap::into_raw(Box::new(SSHSpawnProcess::new(
+                    process,
+                    this.connection,
+                    this.operation_id,
+                )));
+                let value = unsafe { SSHSpawnProcess::to_js_ptr(ptr, global) };
+                promise.resolve(global, value)
+            }
+            Err(error) => {
+                this.connection.finish_operation(this.operation_id);
+                let error = exec_error_to_js(global, error)?;
+                promise.reject_with_async_stack(global, Ok(error))
+            }
+        }
+    }
 }
 
 // SAFETY: every field is owned or thread-safe. The ref keeps the connection
@@ -633,6 +979,16 @@ fn exec_error_to_js(global: &JSGlobalObject, error: ExecError) -> JsResult<JSVal
     Ok(value)
 }
 
+fn process_error_to_js(global: &JSGlobalObject, error: ProcessError) -> JsResult<JSValue> {
+    let value = native_error(global, error.to_string(), error.code(), error.phase())?;
+    value.put(
+        global,
+        b"remoteExecution",
+        remote_execution_to_js(global, error.remote_execution())?,
+    );
+    Ok(value)
+}
+
 fn exit_status_to_js(global: &JSGlobalObject, status: &ExitStatus) -> JsResult<JSValue> {
     let object = JSValue::create_empty_object(global, 4);
     match status {
@@ -686,12 +1042,15 @@ fn remote_execution_to_js(
     global: &JSGlobalObject,
     remote_execution: RemoteExecution,
 ) -> JsResult<JSValue> {
-    let value = match remote_execution {
-        RemoteExecution::NotStarted => b"not-started".as_slice(),
-        RemoteExecution::MayHaveStarted => b"may-have-started".as_slice(),
-        RemoteExecution::ExitObserved => b"exit-observed".as_slice(),
-    };
-    bun_jsc::bun_string_jsc::create_utf8_for_js(global, value)
+    bun_jsc::bun_string_jsc::create_utf8_for_js(global, remote_execution_name(remote_execution))
+}
+
+fn remote_execution_name(remote_execution: RemoteExecution) -> &'static [u8] {
+    match remote_execution {
+        RemoteExecution::NotStarted => b"not-started",
+        RemoteExecution::MayHaveStarted => b"may-have-started",
+        RemoteExecution::ExitObserved => b"exit-observed",
+    }
 }
 
 fn native_error(

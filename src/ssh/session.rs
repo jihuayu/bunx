@@ -9,6 +9,10 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::config::{Auth, Config, TransportConfig};
 use crate::host_key::{HostKeyError, fingerprint, sign_algorithm_name, verifier};
+use crate::process::{BlockingProcess, ProcessConfig, start_driver};
+
+const MAX_INITIAL_CHANNEL_MESSAGES: usize = 256;
+const MAX_INITIAL_CHANNEL_BYTES: usize = 256 * 1024;
 
 pub type ExecCancelSender = watch::Sender<bool>;
 pub type ExecCancelReceiver = watch::Receiver<bool>;
@@ -192,6 +196,23 @@ impl ExecError {
 
     pub fn channel_closed(message: String) -> Self {
         exec_channel_error(message)
+    }
+
+    pub(crate) fn new(
+        code: &'static str,
+        phase: &'static str,
+        message: impl Into<String>,
+        remote_execution: RemoteExecution,
+    ) -> Self {
+        Self {
+            code,
+            phase,
+            message: message.into(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_status: ExitStatus::Unknown,
+            remote_execution,
+        }
     }
 }
 
@@ -434,6 +455,23 @@ impl BlockingSession {
             max_output_bytes,
             cancel,
         ))
+    }
+
+    pub fn start_process(
+        &self,
+        command: Vec<u8>,
+        config: ProcessConfig,
+        timeout: Option<Duration>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<BlockingProcess, ExecError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let runtime = Arc::clone(&self.runtime);
+        self.runtime
+            .block_on(session.start_process_with_cancel(command, config, timeout, cancel, runtime))
     }
 }
 
@@ -695,6 +733,141 @@ impl Session {
             remote_execution,
         })
     }
+
+    async fn start_process_with_cancel(
+        &self,
+        command: Vec<u8>,
+        config: ProcessConfig,
+        timeout: Option<Duration>,
+        mut cancel: watch::Receiver<bool>,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<BlockingProcess, ExecError> {
+        if *cancel.borrow() {
+            return Err(ExecError::new(
+                "ERR_SSH_ABORTED",
+                "exec",
+                "SSH process was aborted",
+                RemoteExecution::NotStarted,
+            ));
+        }
+
+        let deadline = timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return Err(ExecError::new(
+                "ERR_SSH_TIMEOUT",
+                "exec",
+                "SSH process timed out",
+                RemoteExecution::NotStarted,
+            ));
+        }
+
+        let mut channel = {
+            let handle = self.inner.handle.lock().await;
+            let handle = handle
+                .as_ref()
+                .ok_or_else(|| exec_channel_error("SSH session is closed"))?;
+            tokio::select! {
+                result = handle.channel_open_session() => {
+                    result.map_err(|error| ExecError::new(
+                        "ERR_SSH_CHANNEL_OPEN",
+                        "channel",
+                        format!("failed to open SSH channel: {error}"),
+                        RemoteExecution::NotStarted,
+                    ))?
+                }
+                stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                    return Err(exec_stop_error(stop, PartialExec::new()));
+                }
+            }
+        };
+
+        tokio::select! {
+            result = channel.exec(true, command) => {
+                if let Err(error) = result {
+                    let _ = channel.close().await;
+                    return Err(ExecError::new(
+                        "ERR_SSH_IO",
+                        "exec",
+                        format!("failed to send SSH exec request: {error}"),
+                        RemoteExecution::NotStarted,
+                    ));
+                }
+            }
+            stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                let _ = channel.close().await;
+                return Err(exec_stop_error(stop, PartialExec::new()));
+            }
+        }
+
+        let mut initial_messages = Vec::new();
+        let mut initial_bytes = 0usize;
+        loop {
+            let message = tokio::select! {
+                message = channel.wait() => message,
+                stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                    let _ = channel.close().await;
+                    return Err(ExecError::new(
+                        match stop {
+                            ExecStop::Timeout => "ERR_SSH_TIMEOUT",
+                            ExecStop::Cancelled => "ERR_SSH_ABORTED",
+                        },
+                        "exec",
+                        match stop {
+                            ExecStop::Timeout => "SSH process timed out",
+                            ExecStop::Cancelled => "SSH process was aborted",
+                        },
+                        RemoteExecution::MayHaveStarted,
+                    ));
+                }
+            };
+
+            match message {
+                Some(ChannelMsg::Success) => break,
+                Some(ChannelMsg::Failure) => {
+                    let _ = channel.close().await;
+                    return Err(ExecError::new(
+                        "ERR_SSH_EXEC_REJECTED",
+                        "exec",
+                        "SSH server rejected the exec request",
+                        RemoteExecution::NotStarted,
+                    ));
+                }
+                Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
+                    let _ = channel.close().await;
+                    return Err(ExecError::new(
+                        "ERR_SSH_PROTOCOL",
+                        "exec",
+                        "SSH exec request ended without a reply",
+                        RemoteExecution::MayHaveStarted,
+                    ));
+                }
+                Some(message) => {
+                    let message_bytes = match &message {
+                        ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                            data.len()
+                        }
+                        _ => 0,
+                    };
+                    initial_bytes = initial_bytes.saturating_add(message_bytes);
+                    if initial_messages.len() >= MAX_INITIAL_CHANNEL_MESSAGES
+                        || initial_bytes > MAX_INITIAL_CHANNEL_BYTES
+                    {
+                        let _ = channel.close().await;
+                        return Err(ExecError::new(
+                            "ERR_SSH_RESOURCE_LIMIT",
+                            "exec",
+                            "SSH server sent too much data before accepting the exec request",
+                            RemoteExecution::MayHaveStarted,
+                        ));
+                    }
+                    initial_messages.push(message);
+                }
+            }
+        }
+
+        let process = start_driver(channel, runtime, config, cancel, initial_messages);
+        Ok(process)
+    }
 }
 
 async fn read_exec_output(
@@ -778,6 +951,12 @@ async fn wait_for_exec_stop(
     cancel: &mut watch::Receiver<bool>,
     deadline: Option<tokio::time::Instant>,
 ) -> ExecStop {
+    if *cancel.borrow() {
+        return ExecStop::Cancelled;
+    }
+    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+        return ExecStop::Timeout;
+    }
     tokio::select! {
         result = cancel.changed() => {
             let _ = result;

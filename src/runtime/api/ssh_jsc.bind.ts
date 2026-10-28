@@ -79,6 +79,20 @@ export const SSHConnection = b.class({
       capability: "js",
       throws: true,
     },
+    startProcess: {
+      rustName: "start_process_js",
+      args: {
+        command: b.bytes({ from: ["buffer"], held: "copied" }),
+        stdinMode: b.string.utf8,
+        stdinData: b.bytes({ from: ["buffer"], held: "copied" }),
+        captureStdout: b.bool,
+        captureStderr: b.bool,
+        timeoutMs: b.u64,
+      },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
     cancelOperation: {
       args: {
         operationId: b.u64,
@@ -86,6 +100,73 @@ export const SSHConnection = b.class({
       returns: b.bool,
       capability: "js",
       throws: false,
+    },
+  },
+});
+
+/** The native side of a spawned SSH process channel. */
+export const SSHProcess = b.class({
+  rustPath: "crate::api::ssh_jsc::SSHSpawnProcess",
+  refCounted: true,
+  finalize: true,
+  configurable: false,
+  proto: {
+    readStdout: {
+      args: { maxBytes: b.usize },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    readStderr: {
+      args: { maxBytes: b.usize },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    discardStdout: {
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    discardStderr: {
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    writeStdin: {
+      args: { data: b.bytes({ from: ["buffer"], held: "copied" }) },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    closeStdin: {
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    sendSignal: {
+      args: { signal: b.string.utf8 },
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    cancel: {
+      returns: b.bool,
+      capability: "js",
+      throws: false,
+    },
+    waitExit: {
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    waitClosed: {
+      returns: b.any,
+      capability: "js",
+      throws: true,
+    },
+    remoteExecution: {
+      getter: b.string.utf8,
     },
   },
 });

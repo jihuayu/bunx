@@ -125,6 +125,33 @@ declare module "bun" {
   }
 
   /**
+   * Options for {@link SSH.spawn}.
+   */
+  interface SpawnOptions extends OperationOptions {
+    /**
+     * Standard input mode. `"ignore"` sends EOF immediately, `"pipe"` exposes
+     * a writable stream, and `{ data }` writes an initial value then sends EOF.
+     *
+     * @default "ignore"
+     */
+    stdin?: "ignore" | "pipe" | { data: SSHInput } | undefined;
+
+    /**
+     * Standard output handling. `"ignore"` drains output without buffering it.
+     *
+     * @default "pipe"
+     */
+    stdout?: "pipe" | "ignore" | undefined;
+
+    /**
+     * Standard error handling. `"ignore"` drains output without buffering it.
+     *
+     * @default "pipe"
+     */
+    stderr?: "pipe" | "ignore" | undefined;
+  }
+
+  /**
    * The fully buffered result of {@link SSH.exec}.
    */
   interface SSHResult {
@@ -146,6 +173,57 @@ declare module "bun" {
 
     /** Parse {@link text} as JSON. */
     json(): unknown;
+  }
+
+  /** A POSIX signal name accepted by {@link SSHProcess.sendSignal}. */
+  type SSHSignal =
+    "ABRT" | "ALRM" | "FPE" | "HUP" | "ILL" | "INT" | "KILL" | "PIPE" | "QUIT" | "SEGV" | "TERM" | "USR1" | "USR2";
+
+  /**
+   * One running remote command with live standard I/O streams.
+   *
+   * `exited` can resolve before all output has been consumed. Await `closed`
+   * to observe that the local channel and stream resources are released.
+   */
+  interface SSHProcess extends AsyncDisposable {
+    /** The writable stdin stream, or `null` when stdin is not piped. */
+    readonly stdin: WritableStream<Uint8Array<ArrayBufferLike>> | null;
+
+    /** The readable stdout stream, or `null` when stdout is ignored. */
+    readonly stdout: ReadableStream<Uint8Array<ArrayBufferLike>> | null;
+
+    /** The readable stderr stream, or `null` when stderr is ignored. */
+    readonly stderr: ReadableStream<Uint8Array<ArrayBufferLike>> | null;
+
+    /**
+     * The remote exit status. Resolves `{ type: "unknown" }` after a clean
+     * channel close without a status, and rejects after cancellation or a
+     * connection failure before any status arrives.
+     */
+    readonly exited: Promise<ExitStatus>;
+
+    /** Resolves after local process and stream resources are released. Never rejects. */
+    readonly closed: Promise<void>;
+
+    /** The exit code, or `null` for signals and unknown status. */
+    readonly exitCode: number | null;
+
+    /** Whether the remote command may have started. */
+    readonly remoteExecution: RemoteExecution;
+
+    /**
+     * Submit a signal for the remote process.
+     *
+     * This does not guarantee the server delivered it or that the process
+     * terminated.
+     */
+    sendSignal(signal: SSHSignal): Promise<void>;
+
+    /** Cancel this process locally. Repeated calls share one cleanup path. */
+    cancel(): Promise<void>;
+
+    /** Cancel a running process using the same bounded path as {@link cancel}. */
+    [Symbol.asyncDispose](): Promise<void>;
   }
 
   /**
@@ -366,6 +444,14 @@ declare module "bun" {
      * configured FIFO channel queue.
      */
     exec(command: string, options?: ExecOptions): Promise<SSHResult>;
+
+    /**
+     * Start one raw command in a dedicated SSH channel.
+     *
+     * The returned promise resolves only after the server accepts the exec
+     * request. Its timeout and abort signal remain active until `closed`.
+     */
+    spawn(command: string, options?: SpawnOptions): Promise<SSHProcess>;
 
     /**
      * Close the SSH connection.

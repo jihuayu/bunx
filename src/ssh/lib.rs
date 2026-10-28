@@ -6,10 +6,12 @@
 
 pub mod config;
 pub mod host_key;
+pub mod process;
 pub mod session;
 
 pub use config::{Auth, Config, HostKeyPolicy, KnownHostsSource, Secret, TransportConfig};
 pub use host_key::{HostKeyError, HostKeyVerifier, KnownHosts, PinnedHostKeys};
+pub use process::{BlockingProcess, ProcessConfig, ProcessError, ProcessExit, ProcessStdin};
 pub use session::{
     AuthError, BlockingSession, CloseError, CloseResult, ConnectError, ConnectionInfo,
     ExecCancelReceiver, ExecCancelSender, ExecError, ExecResult, ExitStatus, RemoteExecution,
