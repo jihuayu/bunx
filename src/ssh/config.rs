@@ -201,7 +201,7 @@ fn validate_text(value: &str, name: &'static str) -> Result<(), &'static str> {
             _ => "username must not be empty",
         });
     }
-    if value.as_bytes().contains(&0) {
+    if bun_core::strings::contains_char(value.as_bytes(), 0) {
         return Err(match name {
             "hostname" => "hostname must not contain NUL",
             _ => "username must not contain NUL",

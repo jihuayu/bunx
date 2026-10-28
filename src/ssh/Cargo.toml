@@ -10,6 +10,7 @@ path = "lib.rs"
 workspace = true
 
 [dependencies]
+bun_core.workspace = true
 data-encoding = "2"
 hmac = "0.13"
 russh = { version = "0.65.0", default-features = false, features = ["ring", "rsa"] }

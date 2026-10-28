@@ -72,7 +72,7 @@ impl KnownHosts {
         let mut accepted = false;
         let mut changed_line = None;
 
-        for (index, raw_line) in self.source.split(|byte| *byte == b'\n').enumerate() {
+        for (index, raw_line) in bun_core::strings::split(&self.source, b"\n").enumerate() {
             let line_number = index + 1;
             let line = strip_cr(raw_line);
             let trimmed = trim_ascii(line);
@@ -80,9 +80,8 @@ impl KnownHosts {
                 continue;
             }
 
-            let mut fields = trimmed
-                .split(|byte| *byte == b' ' || *byte == b'\t')
-                .filter(|field| !field.is_empty());
+            let mut fields =
+                bun_core::strings::split_any(trimmed, b" \t").filter(|field| !field.is_empty());
             let Some(first) = fields.next() else {
                 continue;
             };
@@ -215,7 +214,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 
 fn matches_host(host: &[u8], patterns: &[u8]) -> Result<bool, HostKeyError> {
     let mut matched = false;
-    for raw_pattern in patterns.split(|byte| *byte == b',') {
+    for raw_pattern in bun_core::strings::split(patterns, b",") {
         let (negated, pattern) = match raw_pattern.strip_prefix(b"!") {
             Some(pattern) => (true, pattern),
             None => (false, raw_pattern),
@@ -234,7 +233,7 @@ fn matches_host(host: &[u8], patterns: &[u8]) -> Result<bool, HostKeyError> {
 }
 
 fn hashed_host_matches(host: &[u8], pattern: &[u8]) -> Result<bool, HostKeyError> {
-    let mut fields = pattern.split(|byte| *byte == b'|').skip(2);
+    let mut fields = bun_core::strings::split(pattern, b"|").skip(2);
     let (Some(salt), Some(expected)) = (fields.next(), fields.next()) else {
         return Err(HostKeyError::Invalid {
             message: "malformed hashed known_hosts entry".to_string(),
