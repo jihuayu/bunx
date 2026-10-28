@@ -51,8 +51,10 @@ const configObjectKeys = [
   "maxPendingOperations",
   "queueTimeoutMs",
 ];
-const hostKeyKeys = ["type", "file", "sha256"];
-const authKeys = ["type", "password", "key", "passphrase"];
+const knownHostsKeys = ["type", "file"];
+const pinnedHostKeyKeys = ["type", "sha256"];
+const passwordAuthKeys = ["type", "password"];
+const privateKeyAuthKeys = ["type", "key", "passphrase"];
 const connectKeys = ["signal"];
 const closeKeys = ["force", "gracePeriodMs"];
 const execKeys = ["signal", "timeoutMs", "stdin", "check", "maxOutputBytes"];
@@ -327,10 +329,10 @@ function snapshotPrivateKey(value: unknown, path: string): Uint8Array | Blob | F
 
 function snapshotHostKey(value: unknown) {
   const hostKey = requireRecord(value, "hostKey");
-  rejectUnknownKeys(hostKey, "hostKey", hostKeyKeys);
   const type = ownValue(hostKey, "hostKey", "type");
 
   if (type === "knownHosts") {
+    rejectUnknownKeys(hostKey, "hostKey", knownHostsKeys);
     const file = ownValue(hostKey, "hostKey", "file");
     if (!(file instanceof Blob)) {
       configError('SSH option "hostKey.file" must be a Blob');
@@ -339,6 +341,7 @@ function snapshotHostKey(value: unknown) {
   }
 
   if (type === "pinned") {
+    rejectUnknownKeys(hostKey, "hostKey", pinnedHostKeyKeys);
     const sha256 = ownValue(hostKey, "hostKey", "sha256");
     if (!ArrayIsArray(sha256) || sha256.length === 0) {
       configError('SSH option "hostKey.sha256" must be a non-empty array of strings');
@@ -360,10 +363,10 @@ function snapshotHostKey(value: unknown) {
 
 function snapshotAuth(value: unknown) {
   const auth = requireRecord(value, "auth");
-  rejectUnknownKeys(auth, "auth", authKeys);
   const type = ownValue(auth, "auth", "type");
 
   if (type === "password") {
+    rejectUnknownKeys(auth, "auth", passwordAuthKeys);
     const password = ownValue(auth, "auth", "password");
     if (password === undefined) {
       configError('SSH option "auth.password" is required for password authentication');
@@ -372,6 +375,7 @@ function snapshotAuth(value: unknown) {
   }
 
   if (type === "privateKey") {
+    rejectUnknownKeys(auth, "auth", privateKeyAuthKeys);
     const key = ownValue(auth, "auth", "key");
     if (key === undefined) {
       configError('SSH option "auth.key" is required for private key authentication');

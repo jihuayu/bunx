@@ -255,6 +255,37 @@ describe("Bun.SSH constructor", () => {
     expectConfigError(() => new SSH({ ...validOptions(), hostKey: { type: "pinned", sha256: ["ok"], extra: true } }));
   });
 
+  test("rejects fields from the other host key and authentication variants", () => {
+    expectConfigError(
+      () =>
+        new SSH({
+          ...validOptions(),
+          hostKey: { type: "knownHosts", file: knownHosts, sha256: ["SHA256:unused"] },
+        }),
+    );
+    expectConfigError(
+      () =>
+        new SSH({
+          ...validOptions(),
+          hostKey: { type: "pinned", sha256: ["SHA256:first"], file: knownHosts },
+        }),
+    );
+    expectConfigError(
+      () =>
+        new SSH({
+          ...validOptions(),
+          auth: { type: "password", password: "secret", passphrase: "unused" },
+        }),
+    );
+    expectConfigError(
+      () =>
+        new SSH({
+          ...validOptions(),
+          auth: { type: "privateKey", key: new Uint8Array([1]), password: "unused" },
+        }),
+    );
+  });
+
   test("requires an explicit authentication method", () => {
     expectConfigError(() => new SSH({ ...validOptions(), auth: undefined }));
     expectConfigError(() => new SSH({ ...validOptions(), auth: { type: "agent" } }));
