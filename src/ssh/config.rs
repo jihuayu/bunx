@@ -111,7 +111,7 @@ pub struct TransportConfig {
     pub username: String,
     pub host_key: HostKeyPolicy,
     pub connect_timeout_ms: u64,
-    pub max_channels: usize,
+    pub output_budget: crate::process::OutputBudget,
 }
 
 impl Config {
@@ -189,7 +189,7 @@ impl Config {
             username: self.username.clone(),
             host_key: self.host_key.clone(),
             connect_timeout_ms: self.connect_timeout_ms,
-            max_channels: self.max_channels,
+            output_budget: crate::process::OutputBudget::default(),
         }
     }
 }

@@ -120,6 +120,10 @@ declare module "bun" {
     /**
      * Maximum combined stdout and stderr bytes to retain.
      *
+     * Output also counts toward the 32 MiB per-connection buffer and 256 MiB
+     * shared by all Bun.SSH connections in the same JavaScript VM. Exceeding
+     * either native budget rejects with `ERR_SSH_RESOURCE_LIMIT`.
+     *
      * @default 8 * 1024 * 1024
      */
     maxOutputBytes?: number | undefined;
@@ -140,12 +144,18 @@ declare module "bun" {
     /**
      * Standard output handling. `"ignore"` drains output without buffering it.
      *
+     * Buffered output counts toward the 32 MiB per-connection and 256 MiB
+     * per-VM native output budgets.
+     *
      * @default "pipe"
      */
     stdout?: "pipe" | "ignore" | undefined;
 
     /**
      * Standard error handling. `"ignore"` drains output without buffering it.
+     *
+     * Buffered output counts toward the 32 MiB per-connection and 256 MiB
+     * per-VM native output budgets.
      *
      * @default "pipe"
      */

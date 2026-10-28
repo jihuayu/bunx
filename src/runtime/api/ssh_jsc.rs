@@ -3,11 +3,40 @@ use bun_jsc::{JSGlobalObject, JSPromiseStrong, JSValue, Job, JobContext, JsAffin
 use bun_ssh::{
     Auth, AuthError, BlockingProcess, BlockingSession, CloseError, CloseResult, ConnectError,
     ConnectionInfo, ExecCancelReceiver, ExecCancelSender, ExecError, ExecResult, ExitStatus,
-    HostKeyPolicy, ProcessConfig, ProcessError, ProcessExit, ProcessStdin, RemoteExecution, Secret,
-    TransportConfig, exec_cancellation,
+    HostKeyPolicy, OutputBudget, ProcessConfig, ProcessError, ProcessExit, ProcessStdin,
+    RemoteExecution, Secret, TransportConfig, exec_cancellation,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+#[derive(bun_ptr::ThreadSafeRefCounted)]
+pub(crate) struct SSHBudget {
+    budget: OutputBudget,
+    ref_count: bun_ptr::ThreadSafeRefCount<SSHBudget>,
+}
+
+impl SSHBudget {
+    pub(crate) fn constructor<'a>(
+        heap: &JsHeap<'a>,
+        max_bytes: usize,
+    ) -> bindgen::Result<'a, *mut Self> {
+        if max_bytes == 0 {
+            return Err(
+                heap.type_error(format_args!("SSH output budget must be greater than zero"))
+            );
+        }
+        Ok(bun_core::heap::into_raw(Box::new(Self {
+            budget: OutputBudget::vm(max_bytes),
+            ref_count: bun_ptr::ThreadSafeRefCount::init(),
+        })))
+    }
+
+    pub(crate) fn finalize(&self) {}
+
+    fn budget(&self) -> &OutputBudget {
+        &self.budget
+    }
+}
 
 #[derive(bun_ptr::ThreadSafeRefCounted)]
 pub(crate) struct SSHConnection {
@@ -46,7 +75,7 @@ impl SSHConnection {
         known_hosts: Vec<u8>,
         pins: Option<Vec<bun_core::Utf8Bytes<'static>>>,
         connect_timeout_ms: u64,
-        max_channels: usize,
+        output_budget: &SSHBudget,
     ) -> bindgen::Result<'a, *mut Self> {
         let hostname = checked_utf8(heap, hostname, "hostname")?.into_owned();
         let username = checked_utf8(heap, username, "username")?.into_owned();
@@ -78,7 +107,7 @@ impl SSHConnection {
                 username,
                 host_key,
                 connect_timeout_ms,
-                max_channels,
+                output_budget: OutputBudget::connection(output_budget.budget().clone()),
             },
             session: std::sync::Mutex::new(None),
             close_requested: AtomicBool::new(false),
@@ -970,14 +999,11 @@ impl JobContext for CloseJob {
     const CANCELLABLE: bool = true;
 
     fn run(this: &mut Self, done: bun_jsc::Completion<Self>) -> Option<bun_jsc::Completion<Self>> {
-        this.result = Some(
-            this.connection
-                .close_session_with_cancel(
-                    this.grace_period_ms,
-                    this.cancel.clone(),
-                    this.operation_id,
-                ),
-        );
+        this.result = Some(this.connection.close_session_with_cancel(
+            this.grace_period_ms,
+            this.cancel.clone(),
+            this.operation_id,
+        ));
         Some(done)
     }
 

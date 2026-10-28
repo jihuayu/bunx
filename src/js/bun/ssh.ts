@@ -19,6 +19,7 @@ const DEFAULT_CLOSE_GRACE_PERIOD_MS = 5_000;
 const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
 const DEFAULT_SPAWN_TIMEOUT_MS = 0;
 const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_VM_OUTPUT_BYTES = 256 * 1024 * 1024;
 const SHA256_PREFIX = "SHA256:";
 const MAX_KNOWN_HOSTS_BYTES = 8 * 1024 * 1024;
 const MAX_PRIVATE_KEY_BYTES = 1024 * 1024;
@@ -28,7 +29,9 @@ const MAX_PROCESS_CHUNK_BYTES = 64 * 1024;
 const LIVENESS_CHECK_INTERVAL_MS = 500;
 const MAX_TIMER_DELAY_MS = 0x7fff_ffff;
 const EMPTY_BYTES = new Uint8Array();
+const NativeSSHBudget = $bindgen("ssh_jsc.bind.ts", "SSHBudget");
 const NativeSSHConnection = $bindgen("ssh_jsc.bind.ts", "SSHConnection");
+const nativeOutputBudget = new NativeSSHBudget(MAX_VM_OUTPUT_BYTES);
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const AUTH_TIMEOUT = Symbol("SSH authentication timeout");
@@ -1852,7 +1855,7 @@ class SSH {
         knownHosts,
         pins,
         remainingConnectMs,
-        this.#options.maxChannels,
+        nativeOutputBudget,
       );
 
       transport = native.connectTransport();

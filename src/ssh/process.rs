@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Sig};
@@ -8,15 +9,30 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 
 use crate::session::{ExecCancelReceiver, ExitStatus, RemoteExecution};
 
-const MAX_OUTPUT_STREAM_BYTES: usize = 256 * 1024;
 const MAX_CHANNEL_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_OUTPUT_STREAM_BYTES: usize = 256 * 1024;
 pub const MAX_CONNECTION_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const INPUT_QUEUE_CAPACITY: usize = 8;
+const OUTPUT_BACKPRESSURE_WAIT: Duration = Duration::from_millis(100);
 
-#[derive(Clone)]
-pub(crate) struct OutputBudget {
-    used: Arc<std::sync::Mutex<usize>>,
+#[derive(Clone, Debug)]
+pub struct OutputBudget {
+    used: Arc<AtomicUsize>,
     limit: usize,
+    resource: &'static str,
+    parent: Option<Arc<OutputBudget>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputBudgetLimit {
+    pub resource: &'static str,
+    pub limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputBudgetReservation {
+    pub bytes: usize,
+    pub limit: Option<OutputBudgetLimit>,
 }
 
 impl Default for OutputBudget {
@@ -27,9 +43,23 @@ impl Default for OutputBudget {
 
 impl OutputBudget {
     pub(crate) fn with_limit(limit: usize) -> Self {
+        Self::with_parent(limit, "connection", None)
+    }
+
+    pub fn vm(limit: usize) -> Self {
+        Self::with_parent(limit, "VM", None)
+    }
+
+    pub fn connection(parent: OutputBudget) -> Self {
+        Self::with_parent(MAX_CONNECTION_OUTPUT_BYTES, "connection", Some(parent))
+    }
+
+    fn with_parent(limit: usize, resource: &'static str, parent: Option<OutputBudget>) -> Self {
         Self {
-            used: Arc::new(std::sync::Mutex::new(0)),
+            used: Arc::new(AtomicUsize::new(0)),
             limit,
+            resource,
+            parent: parent.map(Arc::new),
         }
     }
 
@@ -37,37 +67,88 @@ impl OutputBudget {
         self.limit
     }
 
-    pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
-        let mut used = self.used.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(next) = used.checked_add(bytes) else {
-            return false;
-        };
-        if next > self.limit {
-            return false;
+    pub(crate) fn limit_info(&self) -> OutputBudgetLimit {
+        OutputBudgetLimit {
+            resource: self.resource,
+            limit: self.limit,
         }
-        *used = next;
-        true
     }
 
-    fn try_reserve_up_to(&self, bytes: usize) -> usize {
-        let mut used = self.used.lock().unwrap_or_else(|error| error.into_inner());
-        let retained = bytes.min(self.limit.saturating_sub(*used));
-        *used += retained;
-        retained
+    fn available(&self) -> usize {
+        let local = self.limit.saturating_sub(self.used());
+        match self.parent.as_deref() {
+            Some(parent) => local.min(parent.available()),
+            None => local,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
+        self.try_reserve_up_to(bytes).bytes == bytes
+    }
+
+    pub(crate) fn try_reserve_up_to(&self, bytes: usize) -> OutputBudgetReservation {
+        let parent_reservation = match self.parent.as_deref() {
+            Some(parent) => parent.try_reserve_up_to(bytes),
+            None => OutputBudgetReservation { bytes, limit: None },
+        };
+        let reserved = self.reserve_up_to(parent_reservation.bytes);
+        if reserved < parent_reservation.bytes
+            && let Some(parent) = self.parent.as_deref()
+        {
+            parent.release(parent_reservation.bytes - reserved);
+        }
+
+        if let Some(limit) = parent_reservation.limit {
+            OutputBudgetReservation {
+                bytes: reserved,
+                limit: Some(limit),
+            }
+        } else if reserved < bytes {
+            OutputBudgetReservation {
+                bytes: reserved,
+                limit: Some(self.limit_info()),
+            }
+        } else {
+            OutputBudgetReservation {
+                bytes: reserved,
+                limit: None,
+            }
+        }
+    }
+
+    fn reserve_up_to(&self, bytes: usize) -> usize {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let reservation = bytes.min(self.limit.saturating_sub(used));
+            if reservation == 0 {
+                return 0;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + reservation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return reservation,
+                Err(actual) => used = actual,
+            }
+        }
     }
 
     pub(crate) fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        let mut used = self.used.lock().unwrap_or_else(|error| error.into_inner());
-        debug_assert!(*used >= bytes, "SSH output budget released twice");
-        *used = used.saturating_sub(bytes);
+        let previous = self.used.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "SSH output budget released twice");
+        if let Some(parent) = self.parent.as_deref() {
+            parent.release(bytes);
+        }
     }
 
-    #[cfg(test)]
     fn used(&self) -> usize {
-        *self.used.lock().unwrap_or_else(|error| error.into_inner())
+        self.used.load(Ordering::Acquire)
     }
 }
 
@@ -202,64 +283,123 @@ impl OutputPipe {
             return;
         }
 
+        let mut changed = self.changed.subscribe();
+        let deadline = tokio::time::Instant::now() + OUTPUT_BACKPRESSURE_WAIT;
+        loop {
+            let mut state = self.state.lock().await;
+            if state.done || state.discard {
+                return;
+            }
+
+            let available = (MAX_OUTPUT_STREAM_BYTES - state.bytes)
+                .min(state.channel_budget.available())
+                .min(state.connection_budget.available());
+            if available >= data.len() && self.try_append(&mut state, &data) {
+                drop(state);
+                self.touch();
+                return;
+            }
+            drop(state);
+
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = changed.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+
         let mut state = self.state.lock().await;
         if state.done || state.discard {
             return;
         }
+        self.append_limited(&mut state, &mut data, remote_execution);
+        drop(state);
+        self.touch();
+    }
 
+    fn try_append(&self, state: &mut OutputState, data: &[u8]) -> bool {
+        let channel_reservation = state.channel_budget.try_reserve_up_to(data.len());
+        let connection_reservation = state
+            .connection_budget
+            .try_reserve_up_to(channel_reservation.bytes);
+        if connection_reservation.bytes != data.len() {
+            state.channel_budget.release(channel_reservation.bytes);
+            state
+                .connection_budget
+                .release(connection_reservation.bytes);
+            return false;
+        }
+
+        state.bytes += data.len();
+        state.chunks.push_back(data.to_vec());
+        true
+    }
+
+    fn append_limited(
+        &self,
+        state: &mut OutputState,
+        data: &mut Vec<u8>,
+        remote_execution: RemoteExecution,
+    ) {
         let original_len = data.len();
         let stream_reserved = original_len.min(MAX_OUTPUT_STREAM_BYTES.saturating_sub(state.bytes));
-        let channel_reserved = state.channel_budget.try_reserve_up_to(stream_reserved);
-        let connection_reserved = state.connection_budget.try_reserve_up_to(channel_reserved);
-        if connection_reserved < channel_reserved {
+        let channel_reserved = state
+            .channel_budget
+            .try_reserve_up_to(stream_reserved)
+            .bytes;
+        let connection_reservation = state.connection_budget.try_reserve_up_to(channel_reserved);
+        if connection_reservation.bytes < channel_reserved {
             state
                 .channel_budget
-                .release(channel_reserved - connection_reserved);
+                .release(channel_reserved - connection_reservation.bytes);
         }
-        let retained = connection_reserved;
+        let retained = connection_reservation.bytes;
         if retained != 0 {
             data.truncate(retained);
             state.bytes += retained;
-            state.chunks.push_back(data);
+            state.chunks.push_back(std::mem::take(data));
         }
-        if retained < original_len {
-            state.done = true;
-            if state.error.is_none() {
-                state.error = Some(if connection_reserved < channel_reserved {
-                    ProcessError::new(
-                        "ERR_SSH_RESOURCE_LIMIT",
-                        "io",
-                        format!(
-                            "SSH connection output budget of {} bytes was exceeded",
-                            state.connection_budget.limit()
-                        ),
-                        remote_execution,
-                    )
-                } else if channel_reserved < stream_reserved {
-                    ProcessError::new(
-                        "ERR_SSH_OUTPUT_LIMIT",
-                        "io",
-                        format!(
-                            "SSH process output exceeded the {}-byte channel buffer",
-                            state.channel_budget.limit()
-                        ),
-                        remote_execution,
-                    )
-                } else {
-                    ProcessError::new(
-                        "ERR_SSH_OUTPUT_LIMIT",
-                        "io",
-                        format!(
-                            "SSH process {} exceeded its {}-byte output buffer",
-                            self.name, MAX_OUTPUT_STREAM_BYTES
-                        ),
-                        remote_execution,
-                    )
-                });
-            }
+        if retained == original_len {
+            return;
         }
-        drop(state);
-        self.touch();
+
+        state.done = true;
+        if state.error.is_some() {
+            return;
+        }
+        state.error = Some(if let Some(limit) = connection_reservation.limit {
+            ProcessError::new(
+                "ERR_SSH_RESOURCE_LIMIT",
+                "io",
+                format!(
+                    "SSH {} output budget of {} bytes was exceeded",
+                    limit.resource, limit.limit
+                ),
+                remote_execution,
+            )
+        } else if channel_reserved < stream_reserved {
+            ProcessError::new(
+                "ERR_SSH_OUTPUT_LIMIT",
+                "io",
+                format!(
+                    "SSH process output exceeded the {}-byte channel buffer",
+                    state.channel_budget.limit()
+                ),
+                remote_execution,
+            )
+        } else {
+            ProcessError::new(
+                "ERR_SSH_OUTPUT_LIMIT",
+                "io",
+                format!(
+                    "SSH process {} exceeded its {}-byte output buffer",
+                    self.name, MAX_OUTPUT_STREAM_BYTES
+                ),
+                remote_execution,
+            )
+        });
     }
 
     async fn read(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, ProcessError> {
@@ -989,6 +1129,55 @@ mod tests {
         assert_eq!(connection_budget.used(), 3);
         first.discard().await;
         assert_eq!(connection_budget.used(), 0);
+    }
+
+    #[test]
+    fn connection_budgets_share_and_release_a_vm_budget() {
+        let vm_budget = OutputBudget::vm(6);
+        let first = OutputBudget::with_parent(4, "connection", Some(vm_budget.clone()));
+        let second = OutputBudget::with_parent(4, "connection", Some(vm_budget.clone()));
+
+        assert!(first.try_reserve(4));
+        let reservation = second.try_reserve_up_to(3);
+        assert_eq!(reservation.bytes, 2);
+        assert_eq!(
+            reservation.limit,
+            Some(OutputBudgetLimit {
+                resource: "VM",
+                limit: 6
+            })
+        );
+        let reservation = first.try_reserve_up_to(1);
+        assert_eq!(reservation.bytes, 0);
+        assert_eq!(
+            reservation.limit,
+            Some(OutputBudgetLimit {
+                resource: "VM",
+                limit: 6
+            })
+        );
+        first.release(4);
+        second.release(2);
+
+        assert!(first.try_reserve(4));
+        assert_eq!(
+            second.try_reserve_up_to(3).limit,
+            Some(OutputBudgetLimit {
+                resource: "VM",
+                limit: 6
+            })
+        );
+
+        let vm_budget = OutputBudget::vm(100);
+        let connection = OutputBudget::with_parent(4, "connection", Some(vm_budget));
+        assert!(connection.try_reserve(4));
+        assert_eq!(
+            connection.try_reserve_up_to(1).limit,
+            Some(OutputBudgetLimit {
+                resource: "connection",
+                limit: 4
+            })
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,9 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::config::{Auth, Config, TransportConfig};
 use crate::host_key::{HostKeyError, fingerprint, sign_algorithm_name, verifier};
-use crate::process::{BlockingProcess, OutputBudget, ProcessConfig, start_driver};
+use crate::process::{
+    BlockingProcess, OutputBudget, OutputBudgetLimit, ProcessConfig, start_driver,
+};
 
 const MAX_INITIAL_CHANNEL_MESSAGES: usize = 256;
 const MAX_INITIAL_CHANNEL_BYTES: usize = 256 * 1024;
@@ -271,10 +273,16 @@ impl PartialExec {
             return PartialExecPush::OutputLimit;
         }
         let Some(reserved) = self.reserved_output.checked_add(data.len()) else {
-            return PartialExecPush::ResourceLimit;
+            return PartialExecPush::ResourceLimit(self.output_budget.limit_info());
         };
-        if !self.output_budget.try_reserve(data.len()) {
-            return PartialExecPush::ResourceLimit;
+        let reservation = self.output_budget.try_reserve_up_to(data.len());
+        if reservation.bytes != data.len() {
+            self.output_budget.release(reservation.bytes);
+            return PartialExecPush::ResourceLimit(
+                reservation
+                    .limit
+                    .expect("a partial reservation names its limit"),
+            );
         }
         let target = if stderr {
             &mut self.stderr
@@ -323,7 +331,7 @@ impl Drop for PartialExec {
 enum PartialExecPush {
     Accepted,
     OutputLimit,
-    ResourceLimit,
+    ResourceLimit(OutputBudgetLimit),
 }
 
 #[derive(Debug)]
@@ -336,7 +344,7 @@ struct ReadTaskResult {
     output: PartialExec,
     clean_close: bool,
     output_limit: bool,
-    resource_limit: bool,
+    resource_limit: Option<OutputBudgetLimit>,
 }
 
 #[derive(Clone, Copy)]
@@ -894,13 +902,13 @@ impl Session {
 
         close_exec_channel(&write_half).await;
 
-        if output.resource_limit {
+        if let Some(limit) = output.resource_limit {
             return Err(exec_error_from_reader(
                 "ERR_SSH_RESOURCE_LIMIT",
                 "exec",
                 format!(
-                    "SSH connection output budget of {} bytes was exceeded",
-                    output.output.output_budget.limit()
+                    "SSH {} output budget of {} bytes was exceeded",
+                    limit.resource, limit.limit
                 ),
                 output,
             ));
@@ -1087,7 +1095,7 @@ async fn read_exec_output(
     let mut reply = Some(reply);
     let mut clean_close = false;
     let mut output_limit = false;
-    let mut resource_limit = false;
+    let mut resource_limit = None;
     let mut stop_drain_deadline = None;
     let mut stop_drain_messages = 0usize;
     let mut stop_drain_bytes = 0usize;
@@ -1155,8 +1163,8 @@ async fn read_exec_output(
                         }
                         break;
                     }
-                    PartialExecPush::ResourceLimit => {
-                        resource_limit = true;
+                    PartialExecPush::ResourceLimit(limit) => {
+                        resource_limit = Some(limit);
                         if let Some(reply) = reply.take() {
                             let _ = reply.send(ExecReply::Accepted);
                         }
@@ -1175,8 +1183,8 @@ async fn read_exec_output(
                         }
                         break;
                     }
-                    PartialExecPush::ResourceLimit => {
-                        resource_limit = true;
+                    PartialExecPush::ResourceLimit(limit) => {
+                        resource_limit = Some(limit);
                         if let Some(reply) = reply.take() {
                             let _ = reply.send(ExecReply::Accepted);
                         }
@@ -1278,7 +1286,7 @@ async fn finish_exec_reader(
             output: PartialExec::sent(output_budget),
             clean_close: false,
             output_limit: false,
-            resource_limit: false,
+            resource_limit: None,
         },
     }
 }
@@ -1320,7 +1328,7 @@ fn exec_stop_error(stop: ExecStop, output: PartialExec) -> ExecError {
             output,
             clean_close: false,
             output_limit: false,
-            resource_limit: false,
+            resource_limit: None,
         },
     )
 }
@@ -1410,7 +1418,6 @@ async fn connect_inner(
         state: Arc::clone(&state),
     };
     let client_config = client::Config {
-        channel_buffer_size: config.max_channels.min(100),
         nodelay: true,
         ..Default::default()
     };
@@ -1494,7 +1501,7 @@ async fn connect_inner(
         inner: Arc::new(SessionInner {
             handle: Mutex::new(Some(handle)),
             info,
-            output_budget: OutputBudget::default(),
+            output_budget: config.output_budget.clone(),
             _runtime: runtime,
         }),
     })
@@ -1671,7 +1678,7 @@ mod tests {
         ));
         assert!(matches!(
             second.push(true, &[2; 2], 8),
-            PartialExecPush::ResourceLimit
+            PartialExecPush::ResourceLimit(_)
         ));
 
         drop(first);
@@ -2035,7 +2042,7 @@ mod tests {
             username: USERNAME.into(),
             host_key: crate::HostKeyPolicy::Pinned(vec!["SHA256:unused".into()]),
             connect_timeout_ms: 10_000,
-            max_channels: DEFAULT_MAX_CHANNELS,
+            output_budget: OutputBudget::default(),
         };
         let (cancel_sender, cancel_receiver) = exec_cancellation();
         let client = std::thread::spawn(move || {

@@ -1,6 +1,23 @@
 import * as b from "../../codegen/bindgen-lib.ts";
 
 /**
+ * One process-wide pool for SSH output retained by native channels.
+ */
+export const SSHBudget = b.class({
+  rustPath: "crate::api::ssh_jsc::SSHBudget",
+  refCounted: true,
+  finalize: true,
+  configurable: false,
+  construct: {
+    args: {
+      maxBytes: b.usize,
+    },
+    capability: "heap",
+    throws: true,
+  },
+});
+
+/**
  * The native SSH transport. Bun.SSH owns all state and callbacks in JS; this
  * object exists so native work can outlive a single host call without retaining
  * a JavaScript value on the Tokio thread.
@@ -19,7 +36,7 @@ export const SSHConnection = b.class({
       knownHosts: b.bytes({ from: ["buffer"], held: "copied" }),
       pins: b.array(b.string.utf8.owned).nullable,
       connectTimeoutMs: b.u64,
-      maxChannels: b.usize,
+      outputBudget: SSHBudget,
     },
     capability: "heap",
     throws: true,
