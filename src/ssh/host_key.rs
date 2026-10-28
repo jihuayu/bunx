@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use data_encoding::BASE64_MIME;
 use hmac::{Hmac, KeyInit, Mac};
-use russh::keys::{parse_public_key_base64, HashAlg, PublicKey};
+use russh::keys::{HashAlg, PublicKey, parse_public_key_base64};
 use sha1::Sha1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +69,7 @@ impl KnownHosts {
         };
         let fingerprint = fingerprint(key);
         let mut matched_host = false;
+        let mut changed_line = None;
 
         for (index, raw_line) in self.source.split(|byte| *byte == b'\n').enumerate() {
             let line_number = index + 1;
@@ -135,10 +136,7 @@ impl KnownHosts {
                 continue;
             }
             if known.algorithm() == key.algorithm() && known.key_data() != key.key_data() {
-                return Err(HostKeyError::Changed {
-                    line: line_number,
-                    fingerprint,
-                });
+                changed_line.get_or_insert(line_number);
             }
             if known.key_data() == key.key_data() {
                 return Ok(());
@@ -147,7 +145,7 @@ impl KnownHosts {
 
         if matched_host {
             Err(HostKeyError::Changed {
-                line: 0,
+                line: changed_line.unwrap_or(0),
                 fingerprint,
             })
         } else {
@@ -398,6 +396,27 @@ mod tests {
             Err(HostKeyError::Revoked {
                 line: 1,
                 fingerprint: fingerprint(&revoked),
+            })
+        );
+    }
+
+    #[test]
+    fn stale_entries_do_not_shadow_a_current_key() {
+        let stale = test_key();
+        let current = test_key();
+        let source = format!(
+            "localhost {}\nlocalhost {}\n",
+            public_key_fields(&stale),
+            public_key_fields(&current)
+        );
+        let known = KnownHosts::new(source.into_bytes());
+        assert_eq!(known.verify("localhost", 22, &current), Ok(()));
+        let presented = test_key();
+        assert_eq!(
+            known.verify("localhost", 22, &presented),
+            Err(HostKeyError::Changed {
+                line: 1,
+                fingerprint: fingerprint(&presented),
             })
         );
     }
