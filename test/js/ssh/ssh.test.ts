@@ -682,6 +682,23 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     await ssh.close();
   });
 
+  test("cancelling the last connect waiter leaves the client reusable", async () => {
+    const ssh = client();
+    const controller = new AbortController();
+    const connecting = ssh.connect({ signal: controller.signal });
+
+    controller.abort();
+    await expect(connecting).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+    });
+    expect(ssh.state).toBe("idle");
+    expect(ssh.info).toBeNull();
+
+    await ssh.connect();
+    expect(ssh.state).toBe("ready");
+    await ssh.close();
+  });
+
   test("a failed host key check never invokes a secret provider", async () => {
     let passwordCalls = 0;
     const ssh = new SSH({

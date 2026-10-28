@@ -1709,7 +1709,9 @@ class SSH {
         this.#native = null;
       }
 
-      if (this.#state === "connecting") {
+      if (this.#state === "connecting" && signal.aborted && this.#connectWaiters === 0 && this.#closePromise === null) {
+        this.#state = "idle";
+      } else if (this.#state === "connecting") {
         this.#state = "failed";
         this.#settleClosed({
           reason: "failure",
