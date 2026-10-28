@@ -616,10 +616,16 @@ impl Session {
             }
         };
 
-        channel
-            .exec(true, command)
-            .await
-            .map_err(|error| ExecError {
+        let exec_result = tokio::select! {
+            result = channel.exec(true, command) => result,
+            stop = wait_for_exec_stop(&mut cancel, deadline) => {
+                let _ = tokio::time::timeout(Duration::from_millis(250), channel.close()).await;
+                return Err(exec_stop_error(stop, PartialExec::sent()));
+            }
+        };
+        if let Err(error) = exec_result {
+            let _ = channel.close().await;
+            return Err(ExecError {
                 code: "ERR_SSH_IO",
                 phase: "exec",
                 message: format!("failed to send SSH exec request: {error}"),
@@ -627,7 +633,8 @@ impl Session {
                 stderr: Vec::new(),
                 exit_status: ExitStatus::Unknown,
                 remote_execution: RemoteExecution::MayHaveStarted,
-            })?;
+            });
+        }
 
         let (mut read_half, write_half) = channel.split();
         let (reply_sender, reply_receiver) = oneshot::channel();
@@ -1367,6 +1374,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
         channel_gate: Option<Arc<ChannelGate>>,
         auth_gate: Option<Arc<AuthGate>>,
+        exec_gate: Option<Arc<ExecGate>>,
     }
 
     struct ChannelGate {
@@ -1381,6 +1389,13 @@ mod tests {
         entered: std::sync::atomic::AtomicBool,
     }
 
+    struct ExecGate {
+        opened: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+        entered: std::sync::atomic::AtomicBool,
+    }
+
     impl server::Server for TestServer {
         type Handler = TestHandler;
 
@@ -1389,6 +1404,7 @@ mod tests {
                 attempts: Arc::clone(&self.attempts),
                 channel_gate: self.channel_gate.clone(),
                 auth_gate: self.auth_gate.clone(),
+                exec_gate: self.exec_gate.clone(),
             }
         }
     }
@@ -1397,6 +1413,7 @@ mod tests {
         attempts: Arc<AtomicUsize>,
         channel_gate: Option<Arc<ChannelGate>>,
         auth_gate: Option<Arc<AuthGate>>,
+        exec_gate: Option<Arc<ExecGate>>,
     }
 
     impl server::Handler for TestHandler {
@@ -1456,6 +1473,17 @@ mod tests {
             data: &[u8],
             session: &mut server::Session,
         ) -> Result<(), Self::Error> {
+            if data == b"stalled-exec" {
+                if let Some(gate) = &self.exec_gate {
+                    if !gate.entered.swap(true, Ordering::SeqCst) {
+                        gate.opened.notify_one();
+                        gate.release.notified().await;
+                    }
+                    gate.finished.notify_one();
+                }
+                let _ = session.channel_success(channel);
+                return Ok(());
+            }
             session.channel_success(channel)?;
             match data {
                 b"gated-ok" => {
@@ -1505,6 +1533,7 @@ mod tests {
     async fn start_server_with_gates(
         channel_gate: Option<Arc<ChannelGate>>,
         auth_gate: Option<Arc<AuthGate>>,
+        exec_gate: Option<Arc<ExecGate>>,
     ) -> RunningServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1526,6 +1555,7 @@ mod tests {
             attempts: Arc::clone(&attempts),
             channel_gate: channel_gate.clone(),
             auth_gate: auth_gate.clone(),
+            exec_gate,
         };
         let task = tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -1539,7 +1569,7 @@ mod tests {
     }
 
     async fn start_server() -> RunningServer {
-        start_server_with_gates(None, None).await
+        start_server_with_gates(None, None, None).await
     }
 
     struct BlockingServer {
@@ -1574,6 +1604,7 @@ mod tests {
             attempts,
             channel_gate: None,
             auth_gate: None,
+            exec_gate: None,
         };
         runtime.spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -1811,7 +1842,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
             opens: AtomicUsize::new(0),
         });
-        let server = start_server_with_gates(Some(Arc::clone(&gate)), None).await;
+        let server = start_server_with_gates(Some(Arc::clone(&gate)), None, None).await;
         let config = config(&server, known_hosts(&server), password_auth());
         let session = connect(&config).await.unwrap();
         session.authenticate(&config).await.unwrap();
@@ -1849,13 +1880,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_cancellation_interrupts_a_stalled_exec_request() {
+        let gate = Arc::new(ExecGate {
+            opened: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            entered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let server = start_server_with_gates(None, None, Some(Arc::clone(&gate))).await;
+        let config = config(&server, known_hosts(&server), password_auth());
+        let session = connect(&config).await.unwrap();
+        session.authenticate(&config).await.unwrap();
+
+        let (cancel_sender, cancel) = exec_cancellation();
+        let task_session = session.clone();
+        let task = tokio::spawn(async move {
+            task_session
+                .exec_with_cancel(b"stalled-exec".to_vec(), Vec::new(), None, 1024, cancel)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), gate.opened.notified())
+            .await
+            .expect("server did not receive the exec request");
+        cancel_sender.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled exec request did not settle")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), "ERR_SSH_ABORTED");
+        assert_eq!(error.phase(), "exec");
+        assert_eq!(error.remote_execution, RemoteExecution::MayHaveStarted);
+
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), gate.finished.notified())
+            .await
+            .expect("stalled exec request did not finish");
+        let (_cancel_sender, cancel) = exec_cancellation();
+        let result = session
+            .exec_with_cancel(b"gated-ok".to_vec(), Vec::new(), None, 1024, cancel)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, b"ok");
+        assert_eq!(result.exit_status, ExitStatus::Exit { code: 0 });
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn authentication_cancellation_interrupts_a_stalled_server() {
         let gate = Arc::new(AuthGate {
             opened: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             entered: std::sync::atomic::AtomicBool::new(false),
         });
-        let server = start_server_with_gates(None, Some(Arc::clone(&gate))).await;
+        let server = start_server_with_gates(None, Some(Arc::clone(&gate)), None).await;
         let config = config(&server, known_hosts(&server), password_auth());
         let session = connect(&config).await.unwrap();
 
