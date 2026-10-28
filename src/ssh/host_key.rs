@@ -211,16 +211,23 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn matches_host(host: &[u8], patterns: &[u8]) -> Result<bool, HostKeyError> {
-    for pattern in patterns.split(|byte| *byte == b',') {
-        if pattern.starts_with(b"|1|") {
-            if hashed_host_matches(host, pattern)? {
-                return Ok(true);
-            }
-        } else if wildcard_match(pattern, host) {
-            return Ok(true);
+    let mut matched = false;
+    for raw_pattern in patterns.split(|byte| *byte == b',') {
+        let (negated, pattern) = match raw_pattern.strip_prefix(b"!") {
+            Some(pattern) => (true, pattern),
+            None => (false, raw_pattern),
+        };
+        let matches = if pattern.starts_with(b"|1|") {
+            hashed_host_matches(host, pattern)?
+        } else {
+            wildcard_match(pattern, host)
+        };
+        if negated && matches {
+            return Ok(false);
         }
+        matched |= matches;
     }
-    Ok(false)
+    Ok(matched)
 }
 
 fn hashed_host_matches(host: &[u8], pattern: &[u8]) -> Result<bool, HostKeyError> {
@@ -346,6 +353,19 @@ mod tests {
             known.verify("unrelated.example.com", 22, &key),
             Err(HostKeyError::Unknown { .. })
         ));
+    }
+
+    #[test]
+    fn negated_hosts_are_excluded_from_wildcard_entries() {
+        let key = test_key();
+        let known = known_hosts("*,!blocked.example.com", &key);
+        assert_eq!(known.verify("allowed.example.com", 22, &key), Ok(()));
+        assert_eq!(
+            known.verify("blocked.example.com", 22, &key),
+            Err(HostKeyError::Unknown {
+                fingerprint: fingerprint(&key),
+            })
+        );
     }
 
     #[test]
