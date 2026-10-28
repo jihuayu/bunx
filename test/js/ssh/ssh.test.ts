@@ -819,6 +819,27 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     }
   });
 
+  test("reports a refused TCP connection in the tcp phase", async () => {
+    const port = reservePort();
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "pinned", sha256: ["SHA256:unused"] },
+      auth: { type: "password", password: "unused" },
+      connectTimeoutMs: 1_000,
+    });
+
+    const error = await ssh.connect().catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_CONNECT",
+      phase: "tcp",
+    });
+    expect(ssh.state).toBe("failed");
+    expect(await ssh.closed).toMatchObject({ reason: "failure", error });
+  });
+
   test("exec captures stdout and stderr and reports an explicit non-zero exit", async () => {
     const ssh = await connectedClient();
     try {

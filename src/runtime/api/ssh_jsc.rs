@@ -137,7 +137,7 @@ impl SSHConnection {
             }
         }
         if self.close_requested.load(Ordering::Acquire) {
-            return Err(ConnectError::Io("connection was closed".into()));
+            return Err(ConnectError::Io("tcp", "connection was closed".into()));
         }
 
         let session = BlockingSession::connect_transport(config)?;
@@ -149,7 +149,7 @@ impl SSHConnection {
         if self.close_requested.load(Ordering::Acquire) {
             drop(slot);
             let _ = session.close_with_timeout(std::time::Duration::ZERO);
-            return Err(ConnectError::Io("connection was closed".into()));
+            return Err(ConnectError::Io("tcp", "connection was closed".into()));
         }
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.info());

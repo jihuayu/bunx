@@ -5,6 +5,7 @@ use russh::client::Msg;
 use russh::client::{self, AuthResult, Handle, Handler};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key};
 use russh::{ChannelMsg, Disconnect, Error as RusshError, Sig};
+use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::config::{Auth, Config, TransportConfig};
@@ -34,19 +35,23 @@ pub struct ConnectionInfo {
 
 #[derive(Debug)]
 pub enum ConnectError {
-    Timeout,
+    Timeout(&'static str),
     HostKey(HostKeyError),
     Protocol(String),
-    Io(String),
+    Io(&'static str, String),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Timeout => f.write_str("SSH connection timed out"),
+            Self::Timeout("dns") => f.write_str("SSH DNS lookup timed out"),
+            Self::Timeout("tcp") => f.write_str("SSH TCP connection timed out"),
+            Self::Timeout(_) => f.write_str("SSH handshake timed out"),
             Self::HostKey(error) => error.fmt(f),
             Self::Protocol(message) => write!(f, "SSH protocol error: {message}"),
-            Self::Io(message) => write!(f, "SSH connection error: {message}"),
+            Self::Io("dns", message) => write!(f, "SSH DNS lookup failed: {message}"),
+            Self::Io("tcp", message) => write!(f, "SSH TCP connection failed: {message}"),
+            Self::Io(_, message) => write!(f, "SSH connection error: {message}"),
         }
     }
 }
@@ -56,16 +61,17 @@ impl std::error::Error for ConnectError {}
 impl ConnectError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Timeout => "ERR_SSH_CONNECT_TIMEOUT",
+            Self::Timeout(_) => "ERR_SSH_CONNECT_TIMEOUT",
             Self::HostKey(error) => error.code(),
             Self::Protocol(_) => "ERR_SSH_PROTOCOL",
-            Self::Io(_) => "ERR_SSH_CONNECT",
+            Self::Io(_, _) => "ERR_SSH_CONNECT",
         }
     }
 
     pub fn phase(&self) -> &'static str {
         match self {
-            Self::Timeout | Self::Io(_) | Self::Protocol(_) => "handshake",
+            Self::Timeout(phase) | Self::Io(phase, _) => phase,
+            Self::Protocol(_) => "handshake",
             Self::HostKey(_) => "host-key",
         }
     }
@@ -394,7 +400,7 @@ impl BlockingSession {
                 .enable_all()
                 .thread_name("bun-ssh")
                 .build()
-                .map_err(|error| ConnectError::Io(error.to_string()))?,
+                .map_err(|error| ConnectError::Io("handshake", error.to_string()))?,
         );
         let session =
             runtime.block_on(connect_transport_with_runtime(config, Arc::clone(&runtime)))?;
@@ -1119,14 +1125,42 @@ async fn connect_inner(
         ..Default::default()
     };
     let client_config = Arc::new(client_config);
-    let address = format!("{}:{}", config.hostname, config.port);
-
-    let handle = tokio::time::timeout(
-        Duration::from_millis(config.connect_timeout_ms),
-        client::connect(client_config, address, handler),
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(config.connect_timeout_ms);
+    let addresses = tokio::time::timeout_at(
+        deadline,
+        lookup_host((config.hostname.as_str(), config.port)),
     )
     .await
-    .map_err(|_| ConnectError::Timeout)?
+    .map_err(|_| ConnectError::Timeout("dns"))?
+    .map_err(|error| ConnectError::Io("dns", error.to_string()))?;
+    let mut last_tcp_error = None;
+    let mut socket = None;
+    for address in addresses {
+        match tokio::time::timeout_at(deadline, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => {
+                socket = Some(stream);
+                break;
+            }
+            Ok(Err(error)) => last_tcp_error = Some(error),
+            Err(_) => return Err(ConnectError::Timeout("tcp")),
+        }
+    }
+    let socket = socket.ok_or_else(|| {
+        ConnectError::Io(
+            "tcp",
+            last_tcp_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "hostname resolved to no addresses".into()),
+        )
+    })?;
+    let _ = socket.set_nodelay(true);
+
+    let handle = tokio::time::timeout_at(
+        deadline,
+        client::connect_stream(client_config, socket, handler),
+    )
+    .await
+    .map_err(|_| ConnectError::Timeout("handshake"))?
     .map_err(map_connect_error)?;
 
     let check = receiver.await.map_err(|_| {
@@ -1234,7 +1268,7 @@ fn map_connect_error(error: ClientError) -> ConnectError {
 
 fn map_russh_connect_error(error: RusshError) -> ConnectError {
     match error {
-        RusshError::IO(error) => ConnectError::Io(error.to_string()),
+        RusshError::IO(error) => ConnectError::Io("handshake", error.to_string()),
         RusshError::Disconnect => ConnectError::Protocol("server disconnected".into()),
         other => ConnectError::Protocol(other.to_string()),
     }
@@ -1713,5 +1747,53 @@ mod tests {
         assert_eq!(error.phase(), "io");
         assert_eq!(error.remote_execution(), RemoteExecution::MayHaveStarted);
         process.wait_closed();
+    }
+
+    #[tokio::test]
+    async fn dns_failure_reports_the_dns_phase() {
+        let config = Config::new(
+            "a".repeat(300),
+            22,
+            USERNAME.to_string(),
+            crate::HostKeyPolicy::Pinned(vec!["SHA256:pending".into()]),
+            password_auth(),
+            1_000,
+            1_000,
+            DEFAULT_MAX_CHANNELS,
+            DEFAULT_MAX_PENDING_OPERATIONS,
+            1_000,
+        )
+        .unwrap();
+        let error = connect_transport(&config.transport())
+            .await
+            .err()
+            .expect("DNS lookup unexpectedly succeeded");
+        assert_eq!(error.phase(), "dns");
+    }
+
+    #[tokio::test]
+    async fn tcp_failure_reports_the_tcp_phase() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = Config::new(
+            "127.0.0.1".to_string(),
+            port,
+            USERNAME.to_string(),
+            crate::HostKeyPolicy::Pinned(vec!["SHA256:pending".into()]),
+            password_auth(),
+            1_000,
+            1_000,
+            DEFAULT_MAX_CHANNELS,
+            DEFAULT_MAX_PENDING_OPERATIONS,
+            1_000,
+        )
+        .unwrap();
+        let error = connect_transport(&config.transport())
+            .await
+            .err()
+            .expect("TCP connection unexpectedly succeeded");
+        assert_eq!(error.code(), "ERR_SSH_CONNECT");
+        assert_eq!(error.phase(), "tcp");
     }
 }
