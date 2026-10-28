@@ -33,7 +33,8 @@ declare module "bun" {
   type SSHSecret = string | Uint8Array<ArrayBufferLike>;
 
   /**
-   * An unencrypted SSH private key accepted by Bun.SSH.
+   * An SSH private key accepted by Bun.SSH. Encrypted keys also provide a
+   * passphrase through {@link SSHAuth}.
    */
   type SSHKey = Uint8Array<ArrayBufferLike> | Blob;
 
@@ -402,6 +403,9 @@ declare module "bun" {
 
     /** Bounded stderr captured before an exec error. */
     readonly stderr?: Uint8Array<ArrayBufferLike> | undefined;
+
+    /** The underlying cause supplied by the failing operation or provider. */
+    readonly cause?: unknown;
   }
 
   /**

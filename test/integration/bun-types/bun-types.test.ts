@@ -1193,6 +1193,7 @@ describe("@types/bun integration test", () => {
           const code: Bun.SSHErrorCode = sshError.code;
           const phase: Bun.SSHPhase = sshError.phase;
           const remoteExecution: Bun.RemoteExecution = sshError.remoteExecution;
+          const errorCause: unknown = sshError.cause;
 
           // @ts-expect-error - host keys must use an explicit supported policy
           new SSH({ ...options, hostKey: { type: "none" } });
