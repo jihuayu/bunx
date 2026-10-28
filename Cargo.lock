@@ -1653,6 +1653,7 @@ dependencies = [
  "bun_sourcemap_jsc",
  "bun_spawn",
  "bun_sql_jsc",
+ "bun_ssh",
  "bun_standalone_graph",
  "bun_sys",
  "bun_sys_jsc",

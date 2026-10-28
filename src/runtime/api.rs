@@ -63,6 +63,8 @@ pub(crate) mod markdown_object;
 pub(crate) mod native_promise_context;
 #[path = "api/output_file_jsc.rs"]
 pub(crate) mod output_file_jsc;
+#[path = "api/ssh_jsc.rs"]
+pub(crate) mod ssh_jsc;
 #[path = "api/standalone_graph_jsc.rs"]
 pub(crate) mod standalone_graph_jsc;
 #[path = "api/TOMLObject.rs"]

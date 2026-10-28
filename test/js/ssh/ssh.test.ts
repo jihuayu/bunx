@@ -1,5 +1,8 @@
 import { SSH, SSHError } from "bun";
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { bunEnv, tempDir } from "harness";
 
 const knownHosts = new Blob(["example.com ssh-ed25519 AAAA\n"]);
 
@@ -281,5 +284,383 @@ describe("Bun.SSH constructor", () => {
       auth: { type: "privateKey", key: trackedBlob() },
     });
     expect(ssh.state).toBe("idle");
+  });
+
+  test("validates connect and close options before doing I/O", async () => {
+    const ssh = new SSH(validOptions());
+    await expect(ssh.connect({ timeoutMs: 1 })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    await expect(ssh.connect({ signal: true })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(ssh.connect({ signal: controller.signal })).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+    });
+    expect(ssh.state).toBe("idle");
+
+    await expect(ssh.close({ force: 1 })).rejects.toMatchObject({
+      code: "ERR_SSH_CONFIG",
+      phase: "config",
+    });
+    expect(ssh.state).toBe("idle");
+  });
+});
+
+const sshd =
+  process.platform === "win32" ? null : ["/usr/sbin/sshd", "/usr/local/sbin/sshd"].find(path => existsSync(path));
+const sshKeygen =
+  process.platform === "win32"
+    ? null
+    : ["/usr/bin/ssh-keygen", "/usr/local/bin/ssh-keygen"].find(path => existsSync(path));
+
+function run(cmd: string[]) {
+  const result = Bun.spawnSync({
+    cmd,
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `${cmd[0]} exited with ${result.exitCode}\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+    );
+  }
+}
+
+function reservePort(): number {
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data() {},
+    },
+  });
+  const port = listener.port;
+  listener.stop(true);
+  return port;
+}
+
+async function waitForPort(port: number, process: Bun.Subprocess) {
+  const deadline = performance.now() + 5_000;
+  while (performance.now() < deadline) {
+    if (process.exitCode !== null) {
+      const stderr = await process.stderr.text();
+      throw new Error(`sshd exited before listening on ${port}\n${stderr}`);
+    }
+    try {
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          data() {},
+        },
+      });
+      socket.end();
+      return;
+    } catch {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+  throw new Error(`sshd did not listen on ${port}`);
+}
+
+describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
+  let dir: string & Disposable;
+  let server: Bun.Subprocess;
+  let port: number;
+  let username: string;
+  let knownHosts: Blob;
+  let privateKey: Blob;
+  let encryptedPrivateKey: Blob;
+  let wrongPinsHostKey: Bun.SSHHostKeyPolicy;
+
+  beforeAll(async () => {
+    dir = tempDir("bun-ssh-connection", {});
+    port = reservePort();
+    username = process.env.USER || process.env.LOGNAME || "";
+    if (username === "") {
+      throw new Error("sshd integration test needs USER or LOGNAME");
+    }
+
+    const hostKey = join(dir, "host_key");
+    const clientKey = join(dir, "client_key");
+    const encryptedClientKey = join(dir, "encrypted_client_key");
+    run([sshKeygen!, "-q", "-t", "ed25519", "-N", "", "-f", hostKey]);
+    run([sshKeygen!, "-q", "-t", "ed25519", "-N", "", "-f", clientKey]);
+    run([sshKeygen!, "-q", "-t", "ed25519", "-N", "test-passphrase", "-f", encryptedClientKey]);
+
+    const authorizedKeys = join(dir, "authorized_keys");
+    await Bun.write(
+      authorizedKeys,
+      `${await Bun.file(`${clientKey}.pub`).text()}${await Bun.file(`${encryptedClientKey}.pub`).text()}`,
+    );
+    const publicKey = (await Bun.file(`${hostKey}.pub`).text()).trim().split(/\s+/).slice(0, 2).join(" ");
+    await Bun.write(join(dir, "known_hosts"), `[127.0.0.1]:${port} ${publicKey}\n`);
+
+    const config = join(dir, "sshd_config");
+    await Bun.write(
+      config,
+      [
+        `Port ${port}`,
+        "ListenAddress 127.0.0.1",
+        `HostKey ${hostKey}`,
+        `PidFile ${join(dir, "sshd.pid")}`,
+        `AuthorizedKeysFile ${authorizedKeys}`,
+        "StrictModes no",
+        "UsePAM no",
+        "PasswordAuthentication yes",
+        "KbdInteractiveAuthentication no",
+        "ChallengeResponseAuthentication no",
+        "PermitRootLogin no",
+        `AllowUsers ${username}`,
+        "LogLevel ERROR",
+        "",
+      ].join("\n"),
+    );
+
+    server = Bun.spawn({
+      cmd: [sshd!, "-D", "-e", "-f", config],
+      env: bunEnv,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    await waitForPort(port, server);
+
+    knownHosts = Bun.file(join(dir, "known_hosts"));
+    privateKey = Bun.file(clientKey);
+    encryptedPrivateKey = Bun.file(encryptedClientKey);
+    wrongPinsHostKey = { type: "pinned", sha256: ["SHA256:not-the-server-key"] };
+  });
+
+  afterAll(async () => {
+    if (server && server.exitCode === null) {
+      server.kill();
+      await server.exited;
+    }
+    dir?.[Symbol.dispose]();
+  });
+
+  test("connects, authenticates with a private key, and closes idempotently", async () => {
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "privateKey", key: privateKey },
+      connectTimeoutMs: 5_000,
+      authenticationTimeoutMs: 5_000,
+    });
+
+    expect(ssh.state).toBe("idle");
+    expect(ssh.info).toBeNull();
+    await ssh.connect();
+    expect(ssh.state).toBe("ready");
+    expect(ssh.info).toMatchObject({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKeyAlgorithm: "ssh-ed25519",
+    });
+    expect(ssh.info!.hostKeySHA256).toStartWith("SHA256:");
+    expect(ssh.info!.cipherClientToServer).toBe(ssh.info!.cipherServerToClient);
+    expect(ssh.info!.cipherClientToServer).not.toBe("unknown");
+
+    const firstClose = ssh.close();
+    const secondClose = ssh.close();
+    expect(await firstClose).toEqual({ forced: false });
+    expect(await secondClose).toEqual({ forced: false });
+    expect(ssh.state).toBe("closed");
+    expect(await ssh.closed).toEqual({ reason: "local", forced: false });
+    await expect(ssh.connect()).rejects.toMatchObject({
+      code: "ERR_SSH_CLOSED",
+      phase: "close",
+    });
+  });
+
+  test("resolves an encrypted private key passphrase only after host verification", async () => {
+    let passphraseCalls = 0;
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: {
+        type: "privateKey",
+        key: encryptedPrivateKey,
+        passphrase: ({ signal }) => {
+          expect(signal.aborted).toBe(false);
+          passphraseCalls++;
+          return "test-passphrase";
+        },
+      },
+    });
+
+    await ssh.connect();
+    expect(passphraseCalls).toBe(1);
+    await ssh.close();
+  });
+
+  test("one cancelled connect waiter does not cancel another waiter", async () => {
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "privateKey", key: privateKey },
+    });
+    const controller = new AbortController();
+    const cancelled = ssh.connect({ signal: controller.signal });
+    const remaining = ssh.connect();
+
+    controller.abort();
+    await expect(cancelled).rejects.toMatchObject({
+      code: "ERR_SSH_ABORTED",
+    });
+    await remaining;
+    expect(ssh.state).toBe("ready");
+    await ssh.close();
+  });
+
+  test("a failed host key check never invokes a secret provider", async () => {
+    let passwordCalls = 0;
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: wrongPinsHostKey,
+      auth: {
+        type: "password",
+        password: () => {
+          passwordCalls++;
+          return "must-not-be-used";
+        },
+      },
+    });
+
+    const error = await ssh.connect().catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_HOST_KEY_UNKNOWN",
+      phase: "host-key",
+    });
+    expect(passwordCalls).toBe(0);
+    expect(ssh.state).toBe("failed");
+    expect(await ssh.closed).toMatchObject({
+      reason: "failure",
+      forced: false,
+      error,
+    });
+  });
+
+  test("surfaces rejected password authentication as an SSHError", async () => {
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "password", password: "definitely the wrong password" },
+      authenticationTimeoutMs: 5_000,
+    });
+
+    const error = await ssh.connect().catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_AUTH",
+      phase: "auth",
+    });
+    expect(ssh.state).toBe("failed");
+    expect((await ssh.closed).reason).toBe("failure");
+  });
+
+  test("bounds a secret provider that ignores its abort signal", async () => {
+    let providerSignal: AbortSignal | undefined;
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: {
+        type: "password",
+        password: ({ signal }) => {
+          providerSignal = signal;
+          return new Promise(() => {});
+        },
+      },
+      authenticationTimeoutMs: 100,
+    });
+
+    const error = await ssh.connect().catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_AUTH_TIMEOUT",
+      phase: "auth",
+    });
+    expect(providerSignal?.aborted).toBe(true);
+    expect(ssh.state).toBe("failed");
+    expect((await ssh.closed).reason).toBe("failure");
+  });
+
+  test("idle close performs no I/O and async disposal uses close", async () => {
+    const idle = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "privateKey", key: privateKey },
+    });
+    expect(await idle.close()).toEqual({ forced: false });
+    expect(idle.state).toBe("closed");
+    expect(await idle.closed).toEqual({ reason: "local", forced: false });
+
+    const ready = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: knownHosts },
+      auth: { type: "privateKey", key: privateKey },
+    });
+    await ready.connect();
+    await ready[Symbol.asyncDispose]();
+    expect(ready.state).toBe("closed");
+  });
+
+  test("close during a stalled handshake settles the client without waiting for the connect deadline", async () => {
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data() {},
+      },
+    });
+    try {
+      const ssh = new SSH({
+        hostname: "127.0.0.1",
+        port: listener.port,
+        username,
+        hostKey: { type: "pinned", sha256: ["SHA256:unused"] },
+        auth: { type: "password", password: "unused" },
+        connectTimeoutMs: 2_000,
+      });
+      const connecting = ssh.connect().catch(error => error);
+      expect(ssh.state).toBe("connecting");
+
+      const started = performance.now();
+      const closeResult = await ssh.close();
+      const connectError = await connecting;
+      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(closeResult).toEqual({ forced: false });
+      expect(connectError).toBeInstanceOf(SSHError);
+      expect(connectError).toMatchObject({ code: "ERR_SSH_ABORTED" });
+      expect(ssh.state).toBe("closed");
+      expect(await ssh.closed).toEqual({ reason: "local", forced: false });
+    } finally {
+      listener.stop(true);
+    }
   });
 });

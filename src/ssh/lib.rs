@@ -10,4 +10,6 @@ pub mod session;
 
 pub use config::{Auth, Config, HostKeyPolicy, KnownHostsSource, Secret, TransportConfig};
 pub use host_key::{HostKeyError, HostKeyVerifier, KnownHosts, PinnedHostKeys};
-pub use session::{AuthError, ConnectError, ConnectionInfo, Session};
+pub use session::{
+    AuthError, BlockingSession, CloseError, CloseResult, ConnectError, ConnectionInfo, Session,
+};

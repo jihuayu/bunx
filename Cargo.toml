@@ -411,6 +411,7 @@ bun_lint_conformance = { path = "src/lint/conformance" }
 bun_semver = { path = "src/semver" }
 bun_sourcemap = { path = "src/sourcemap" }
 bun_sql = { path = "src/sql" }
+bun_ssh = { path = "src/ssh" }
 bun_sys = { path = "src/sys" }
 bun_threading = { path = "src/threading" }
 bun_valkey = { path = "src/valkey" }

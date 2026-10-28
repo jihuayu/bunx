@@ -223,6 +223,67 @@ pub struct Session {
     inner: Arc<SessionInner>,
 }
 
+/// A session together with the runtime that drives its russh task.
+///
+/// The synchronous methods are for native callers that already run off the
+/// JavaScript thread. Every operation uses the same runtime as the initial
+/// handshake.
+#[derive(Clone)]
+pub struct BlockingSession {
+    runtime: Arc<tokio::runtime::Runtime>,
+    session: Arc<std::sync::Mutex<Session>>,
+}
+
+impl BlockingSession {
+    pub fn connect_transport(config: &TransportConfig) -> Result<Self, ConnectError> {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("bun-ssh")
+                .build()
+                .map_err(|error| ConnectError::Io(error.to_string()))?,
+        );
+        let session =
+            runtime.block_on(connect_transport_with_runtime(config, Arc::clone(&runtime)))?;
+        Ok(Self {
+            runtime,
+            session: Arc::new(std::sync::Mutex::new(session)),
+        })
+    }
+
+    pub fn info(&self) -> ConnectionInfo {
+        self.session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .info()
+            .clone()
+    }
+
+    pub fn authenticate_with(
+        &self,
+        auth: &Auth,
+        username: &str,
+        authentication_timeout_ms: u64,
+    ) -> Result<(), AuthError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.runtime
+            .block_on(session.authenticate_with(auth, username, authentication_timeout_ms))
+    }
+
+    pub fn close_with_timeout(&self, grace_period: Duration) -> Result<CloseResult, CloseError> {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.runtime
+            .block_on(session.close_with_timeout(grace_period))
+    }
+}
+
 impl Session {
     pub fn info(&self) -> &ConnectionInfo {
         &self.inner.info

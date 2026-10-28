@@ -358,6 +358,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "node_util_binding.bind.ts": null,
   "node_zlib_binding.bind.ts": null,
   "socket_body.bind.ts": null,
+  "ssh_jsc.bind.ts": null,
   "udp_socket.bind.ts": null,
 };
 
@@ -1085,6 +1086,10 @@ describe("@types/bun integration test", () => {
             SSH,
             SSHError,
             type SSHAuth,
+            type SSHCloseOptions,
+            type SSHCloseResult,
+            type SSHClosed,
+            type SSHConnectOptions,
             type SSHHostKeyPolicy,
             type SSHOptions,
             type SSHSecret,
@@ -1120,6 +1125,14 @@ describe("@types/bun integration test", () => {
           const bunSsh: Bun.SSH = new Bun.SSH(options);
           const state: Bun.SSHState = ssh.state;
           const info: Bun.SSHConnectionInfo | null = bunSsh.info;
+          const closed: Promise<SSHClosed> = ssh.closed;
+          const connectOptions: SSHConnectOptions = { signal: AbortSignal.timeout(1_000) };
+          const closeOptions: SSHCloseOptions = { force: false, gracePeriodMs: 5_000 };
+          const connecting: Promise<void> = ssh.connect(connectOptions);
+          const closing: Promise<SSHCloseResult> = ssh.close(closeOptions);
+          const disposing: Promise<void> = ssh[Symbol.asyncDispose]();
+
+          const sshWithAsyncDispose: AsyncDisposable = ssh;
 
           declare const sshError: SSHError;
           const code: Bun.SSHErrorCode = sshError.code;
@@ -1137,6 +1150,15 @@ describe("@types/bun integration test", () => {
 
           // @ts-expect-error - unknown configuration fields are rejected
           new SSH({ ...options, hostnam: "example.com" });
+
+          // @ts-expect-error - connect signals must be AbortSignal instances
+          ssh.connect({ signal: true });
+
+          // @ts-expect-error - close force is a boolean
+          ssh.close({ force: 1 });
+
+          // @ts-expect-error - unknown connect fields are rejected
+          ssh.connect({ timeoutMs: 1 });
         `,
       },
       emptyInterfaces: expectedEmptyInterfacesWhenNoDOM,

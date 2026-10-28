@@ -133,6 +133,55 @@ declare module "bun" {
   }
 
   /**
+   * Options for {@link SSH.connect}.
+   */
+  interface SSHConnectOptions {
+    /** Cancels this caller's wait for the connection. */
+    signal?: AbortSignal | undefined;
+  }
+
+  /**
+   * Options for {@link SSH.close}.
+   */
+  interface SSHCloseOptions {
+    /**
+     * Stop waiting for a graceful disconnect immediately.
+     *
+     * @default false
+     */
+    force?: boolean | undefined;
+
+    /**
+     * How long to wait for a graceful disconnect, in milliseconds.
+     *
+     * @default 5_000
+     */
+    gracePeriodMs?: number | undefined;
+  }
+
+  /**
+   * The result of closing an SSH client.
+   */
+  interface SSHCloseResult {
+    /** Whether Bun stopped waiting for a graceful disconnect. */
+    readonly forced: boolean;
+  }
+
+  /**
+   * The terminal state of an SSH client.
+   */
+  interface SSHClosed {
+    /** Who initiated the terminal transition. */
+    readonly reason: "local" | "peer" | "failure";
+
+    /** Whether closing required a forced local disconnect. */
+    readonly forced: boolean;
+
+    /** The terminal connection failure, when `reason` is `"failure"`. */
+    readonly error?: SSHError | undefined;
+  }
+
+  /**
    * Information about an established SSH connection.
    */
   interface SSHConnectionInfo {
@@ -199,7 +248,7 @@ declare module "bun" {
    * The constructor validates and snapshots its options synchronously. It does
    * not resolve DNS, open a socket, read a Blob, or invoke a secret provider.
    */
-  class SSH {
+  class SSH implements AsyncDisposable {
     constructor(options: SSHOptions);
 
     /** The current connection state. */
@@ -207,5 +256,33 @@ declare module "bun" {
 
     /** Connection details after the client is ready, otherwise `null`. */
     readonly info: SSHConnectionInfo | null;
+
+    /**
+     * Resolves when the client reaches a terminal state.
+     *
+     * This promise never rejects. Observe operation failures through their
+     * returned promises or through `close()`.
+     */
+    readonly closed: Promise<SSHClosed>;
+
+    /**
+     * Establish and authenticate the connection.
+     *
+     * Calling this while ready returns immediately, and concurrent calls share
+     * one connection attempt. A client cannot reconnect after `close()` or a
+     * terminal failure.
+     */
+    connect(options?: SSHConnectOptions): Promise<void>;
+
+    /**
+     * Close the SSH connection.
+     *
+     * Closing an idle client performs no network I/O. Concurrent calls share
+     * one close operation.
+     */
+    close(options?: SSHCloseOptions): Promise<SSHCloseResult>;
+
+    /** Close the connection using the same bounded path as {@link SSH.close}. */
+    [Symbol.asyncDispose](): Promise<void>;
   }
 }
