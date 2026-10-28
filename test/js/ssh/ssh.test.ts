@@ -778,6 +778,30 @@ describe.skipIf(!sshd || !sshKeygen)("Bun.SSH connection", () => {
     expect((await ssh.closed).reason).toBe("failure");
   });
 
+  test("connect timeout bounds known_hosts Blob reads", async () => {
+    const hangingKnownHosts = new Blob(["placeholder"]);
+    Object.defineProperty(hangingKnownHosts, "bytes", {
+      value: () => new Promise(() => {}),
+    });
+    const ssh = new SSH({
+      hostname: "127.0.0.1",
+      port,
+      username,
+      hostKey: { type: "knownHosts", file: hangingKnownHosts },
+      auth: { type: "password", password: "unused" },
+      connectTimeoutMs: 100,
+    });
+
+    const error = await ssh.connect().catch(error => error);
+    expect(error).toBeInstanceOf(SSHError);
+    expect(error).toMatchObject({
+      code: "ERR_SSH_CONNECT_TIMEOUT",
+      phase: "host-key",
+    });
+    expect(ssh.state).toBe("failed");
+    expect((await ssh.closed).reason).toBe("failure");
+  });
+
   test("idle close performs no I/O and async disposal uses close", async () => {
     const idle = new SSH({
       hostname: "127.0.0.1",

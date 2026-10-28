@@ -29,6 +29,7 @@ const NativeSSHConnection = $bindgen("ssh_jsc.bind.ts", "SSHConnection");
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const AUTH_TIMEOUT = Symbol("SSH authentication timeout");
+const CONNECT_TIMEOUT = Symbol("SSH connection timeout");
 
 const configObjectKeys = [
   "hostname",
@@ -119,6 +120,9 @@ function abortError(signal: AbortSignal, phase: string): SSHError {
   }
   if (reason === AUTH_TIMEOUT) {
     return runtimeError("SSH authentication timed out", "ERR_SSH_AUTH_TIMEOUT", "auth");
+  }
+  if (reason === CONNECT_TIMEOUT) {
+    return runtimeError("SSH connection timed out", "ERR_SSH_CONNECT_TIMEOUT", phase);
   }
   return runtimeError("SSH operation was aborted", "ERR_SSH_ABORTED", phase, reason);
 }
@@ -1645,9 +1649,11 @@ class SSH {
     let native = null;
     let transportAdopted = false;
     let transport = null;
+    let connectTimer = null;
     let authTimer = null;
 
     try {
+      connectTimer = setTimeout(() => operation.abort(CONNECT_TIMEOUT), this.#options.connectTimeoutMs);
       const hostKey = this.#options.hostKey;
       let knownHosts = EMPTY_BYTES;
       let pins = null;
@@ -1680,6 +1686,8 @@ class SSH {
       }
       transportAdopted = true;
 
+      clearTimeout(connectTimer);
+      connectTimer = null;
       this.#phase = "auth";
       const authStartedAt = performance.now();
       authTimer = setTimeout(() => operation.abort(AUTH_TIMEOUT), this.#options.authenticationTimeoutMs);
@@ -1721,6 +1729,9 @@ class SSH {
       }
       throw error;
     } finally {
+      if (connectTimer !== null) {
+        clearTimeout(connectTimer);
+      }
       if (authTimer !== null) {
         clearTimeout(authTimer);
       }
