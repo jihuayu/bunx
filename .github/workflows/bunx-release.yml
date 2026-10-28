@@ -73,6 +73,7 @@ jobs:
         uses: ./.github/actions/setup-bun
         with:
           bun-version: "1.4.2"
+          download-url: "https://github.com/oven-sh/bun/releases/download"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
